@@ -1,7 +1,7 @@
 from pathlib import Path
 import ebooklib
 from ebooklib import epub
-from wtpsplit import SaT
+# from wtpsplit import SaT
 from lxml import etree
 
 def read_book(book_path: Path) -> epub.EpubBook:
@@ -13,7 +13,6 @@ def get_document(book: epub.EpubBook) -> list[epub.EpubHtml]:
 
 
 if __name__ == "__main__":
-    sat = SaT("sat-31").to('cuda')
     book_path = Path("../books/金閣寺 (三島由紀夫) (Z-Library).epub")
     book = read_book(book_path)
     documents = get_document(book)
