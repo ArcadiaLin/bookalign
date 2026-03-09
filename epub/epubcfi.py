@@ -192,14 +192,7 @@ epubcfi(/6/4!/2/1:3[before,after;s=b]) parsed like
             params[name] = self.parse_csv(value)
             raw = new_raw
         return params, raw
-    
-def decode_cfi(cfi_str):
-    parser = CFIParser()
-    return parser.parse_epubcfi(cfi_str)
 
-def encode_cfi(cfi_dict):
-    # TODO
-    pass
 
 def cfi_to_xpath(cfi_dict):
     """
@@ -213,23 +206,56 @@ def cfi_to_xpath(cfi_dict):
     redirect_steps = cfi_dict['redirect']['step']
     xpath = ''
     for step in redirect_steps:
-        if not step.get('offset'):
-            xpath += f'/child::{step["num"]}'
-        if step.get('id'):
-            xpath += f'[@id="{step["id"]}"]'
+        if 'offset' not in step:
+            if 'id' in step:
+                xpath += f'descendant::{step["id"]}[{step["num"]}]'
+            else:
+                xpath += f'child::{step["num"]}'
+        else:
+            # locate offset in xpath
+            pass
+    return xpath
 
-def xpath_to_cfi(xpath):
-    # TODO
+def cfi_to_content(cfi_dict, book: epub.EpubHtml):
+    xpath = 
+
+def xpath_to_element(xpath, xhtml: epub.EpubHtml):
+    content = xhtml.get_content().decode('utf-8')
+    from lxml import html
+    tree = html.fromstring(content)
+    tree.ma
     pass
 
-def find_package_path(cfi_dict):
+def xpath_to_cfi(xpath):
+    pass
+
+def cfi_to_item(cfi_dict, book: epub.EpubBook):
+    """
+    """
     steps = cfi_dict.get('steps', [])
     if not steps:
         return None
-    
-    return steps[0].get('id')
+    item_index = [step['num'] / 2 - 1 for step in steps]
+    manifest_list = list(book.get_items())
+    spine_list = [item for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)]
+    if item_index[0] == 1:
+        return manifest_list[item_index[1]]
+    elif item_index[0] == 2:
+        return spine_list[item_index[1]]
+    elif item_index[0] == 0:
+        return None
+    # matadata_item_index = item_index[0] - 3
 
 if __name__ == '__main__':
-    test_ebook = epub.read_epub('../books/kinkaku.epub')
-    book = epub.read_epub('../books/kinkaku.epub')
-    book.get_items()
+    test_ebook = "../books/her.epub"
+    book = epub.read_epub(test_ebook)
+    ebook_reader = epub.EpubReader(test_ebook)
+    book = ebook_reader.load()
+    print([item for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)])
+    # print(ebook_reader.opf_file)
+    # print(list(book.get_items()))
+    # print(book.metadata)
+    for item in book.get_items():
+        print(item.get_name(), item.get_type(), item.get_id())
+    print(list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))[3].manifest)
+    print(type(list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))[3]))
