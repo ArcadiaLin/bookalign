@@ -1,4 +1,7 @@
 import re
+from ebooklib import epub
+import ebooklib
+from lxml.etree import XPathEvalError
 
 class CFIParser:
     def __init__(self):
@@ -197,3 +200,36 @@ def decode_cfi(cfi_str):
 def encode_cfi(cfi_dict):
     # TODO
     pass
+
+def cfi_to_xpath(cfi_dict):
+    """
+    convert cfi redirect steps to an xpath expression
+    now support only offset assertion without parameters
+    epubcfi(/6/4!/2/1:3) -> /child::6/child::4/child::2/child::1[position()=3]
+    """
+    from lxml.etree import XPathEvalError
+    if not cfi_dict.get('redirect'):
+        return None
+    redirect_steps = cfi_dict['redirect']['step']
+    xpath = ''
+    for step in redirect_steps:
+        if not step.get('offset'):
+            xpath += f'/child::{step["num"]}'
+        if step.get('id'):
+            xpath += f'[@id="{step["id"]}"]'
+
+def xpath_to_cfi(xpath):
+    # TODO
+    pass
+
+def find_package_path(cfi_dict):
+    steps = cfi_dict.get('steps', [])
+    if not steps:
+        return None
+    
+    return steps[0].get('id')
+
+if __name__ == '__main__':
+    test_ebook = epub.read_epub('../books/kinkaku.epub')
+    book = epub.read_epub('../books/kinkaku.epub')
+    book.get_items()
