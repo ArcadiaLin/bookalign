@@ -193,64 +193,161 @@ epubcfi(/6/4!/2/1:3[before,after;s=b]) parsed like
             raw = new_raw
         return params, raw
 
-
-def cfi_to_xpath(cfi_dict):
+# 从steps找到epubItem
+def _normalize_spine_entry(entry):
     """
-    convert cfi redirect steps to an xpath expression
-    now support only offset assertion without parameters
-    epubcfi(/6/4!/2/1:3) -> /child::6/child::4/child::2/child::1[position()=3]
+    EbookLib 的 spine 项可能是：
+    - 'nav'
+    - ('chapter_1', 'yes')
+    - item object
+    这里统一提取出 idref / uid
     """
-    from lxml.etree import XPathEvalError
-    if not cfi_dict.get('redirect'):
-        return None
-    redirect_steps = cfi_dict['redirect']['step']
-    xpath = ''
-    for step in redirect_steps:
-        if 'offset' not in step:
-            if 'id' in step:
-                xpath += f'descendant::{step["id"]}[{step["num"]}]'
-            else:
-                xpath += f'child::{step["num"]}'
-        else:
-            # locate offset in xpath
-            pass
-    return xpath
+    if isinstance(entry, tuple):
+        return entry[0]
+    if isinstance(entry, str):
+        return entry
+    if hasattr(entry, "id"):
+        return entry.id
+    if hasattr(entry, "get_id"):
+        return entry.get_id()
+    return None
 
-def cfi_to_content(cfi_dict, book: epub.EpubHtml):
-    xpath = 
-
-def xpath_to_element(xpath, xhtml: epub.EpubHtml):
-    content = xhtml.get_content().decode('utf-8')
-    from lxml import html
-    tree = html.fromstring(content)
-    tree.ma
-    pass
-
-def xpath_to_cfi(xpath):
-    pass
-
-def cfi_to_item(cfi_dict, book: epub.EpubBook):
-    """
-    """
+def package_steps_to_item(cfi_dict, book: epub.EpubBook) -> epub.EpubItem:
     steps = cfi_dict.get('steps', [])
-    if not steps:
+    if len(steps) < 2:
         return None
-    item_index = [step['num'] / 2 - 1 for step in steps]
-    manifest_list = list(book.get_items())
-    spine_list = [item for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)]
-    if item_index[0] == 1:
-        return manifest_list[item_index[1]]
-    elif item_index[0] == 2:
-        return spine_list[item_index[1]]
-    elif item_index[0] == 0:
+    item_idx = [step['num'] / 2 - 1 for step in steps]
+
+    manifest_items = list(book.get_items())
+    spine_items = [book.get_item_with_id(_normalize_spine_entry(item)) for item in book.spine]
+    if item_idx[0] == 1:
+        return manifest_items[item_idx[1]]
+    elif item_idx[0] == 2:
+        return spine_items[item_idx[1]]
+    elif item_idx[0] == 0:
         return None
-    # matadata_item_index = item_index[0] - 3
+
+# =========================== 处理 redirect steps ===========================
+def _element_children(node):
+    return [child for child in node if isinstance(child.tag, str)]
+
+def _resolve_even_step(node, num):
+    """
+    偶数 step 表示第几个 element child。
+    /2 -> 第1个元素子节点
+    /4 -> 第2个元素子节点
+    """
+    if num % 2 != 0:
+        return None
+    if idx := num // 2 - 1 < 0 or idx >= len(_element_children(node)): 
+        return None
+    return _element_children(node)[idx]
+
+def resolve_redirect_steps(node, redirect):
+    if not redirect:
+        return None
+    for i, step in enumerate(redirect['steps']):
+        num = step.get('num')
+        node_id = step.get('id')
+        
+        if isinstance(num, int) and num % 2 == 0:
+            next_node = _resolve_even_step(node, num)
+            if next_node is None:
+                return None
+            if node_id is not None:
+                actual_id = next_node.get("id")
+                if actual_id != node_id:
+                    raise ValueError(f"ID assertion failed at step {i}: expected {node_id}, got {actual_id}")
+            node = next_node
+            continue
+        
+        if isinstance(num, int) and num % 2 == 1:
+            if i == len(redirect['steps']) - 1:
+                return {
+                    "node": node,
+                    "offset": step.get("offset", 0),
+                    "assertion": step.get("assertion"),
+                    "terminal_step": step,
+                }
+        return None
+
+    last_step = redirect['steps'][-1] if redirect['steps'] else None
+    return {
+        "node": node,
+        "offset": last_step.get("offset", 0) if last_step else 0,
+        "assertion": last_step.get("assertion") if last_step else None,
+        "terminal_step": last_step,
+    }
+
+def iter_text_segments(element):
+    if element.text:
+        yield (element, 'text', element.text)
+    
+    for child in element:
+        if child.tail:
+            yield (child, 'tail', child.tail)
+
+def resolve_text_offset(resolved):
+    if not resolved:
+        return None
+    
+    node = resolved['node']
+    offset = resolved['offset']
+    if offset is None:
+        return {
+            "type": "element",
+            "node": node,
+        }
+    
+    remain = offset
+    for owner, kind, text in iter_text_segments(node):
+        if remain <= len(text):
+            return {
+                "type": "text",
+                "node": owner,
+                "kind": kind,
+                "text": text,
+                "offset": remain,
+            }
+        remain -= len(text)
+    
+    if remain == 0:
+        return {
+            "type": "text",
+            "node": node,
+            "kind": "text",
+            "text": node.text or "",
+            "offset": len(node.text or ""),
+        }
+    return None
+
+
+def resolve_cfi_to_target(cfi_str, book: epub.EpubBook):
+    cfi_dict = CFIParser().parse_epubcfi(cfi_str)
+    epub_item = package_steps_to_item(cfi_dict, book)
+    if epub_item is None:
+        return None
+    root = epub_item.content
+    
+    redirect_resolved = resolve_redirect_steps(root, cfi_dict.get("redirect"))
+    if redirect_resolved is None:
+        return {
+            "item": epub_item,
+            "target": None,
+        }
+    
+    target = resolve_text_offset(redirect_resolved)
+    return {
+        "item": epub_item,
+        "target": target,
+    }
 
 if __name__ == '__main__':
     test_ebook = "../books/her.epub"
     book = epub.read_epub(test_ebook)
     ebook_reader = epub.EpubReader(test_ebook)
     book = ebook_reader.load()
+    print(book.spine)
     print([item for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT)])
     # print(ebook_reader.opf_file)
     # print(list(book.get_items()))
