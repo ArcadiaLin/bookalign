@@ -1,14 +1,18 @@
-"""多语言句子切分统一接口。"""
+"""Language-aware sentence splitting for EPUB extracted text."""
+
+from __future__ import annotations
 
 import re
 
 
-class SentenceSplitter:
-    """Sentence splitter with language-aware rules.
+_CJK_STOP_PUNCT = {'。', '！', '？', '!', '?'}
+_CJK_CLOSERS = {'」', '』', '）', ')', '】', '》', '"', "'", '’', '”'}
+_ZERO_WIDTH_RE = re.compile(r'[\u200b\u200c\u200d\ufeff]')
+_SPACE_RE = re.compile(r'\s+')
 
-    Uses pysbd as the primary backend, with special handling for
-    CJK languages (Japanese, Chinese).
-    """
+
+class SentenceSplitter:
+    """Sentence splitter with language-aware rules and light normalization."""
 
     def __init__(self, language: str = 'ja'):
         self.language = language
@@ -17,13 +21,15 @@ class SentenceSplitter:
     def _get_splitter(self):
         if self._splitter is None:
             import pysbd
-            lang = self._map_language(self.language)
-            self._splitter = pysbd.Segmenter(language=lang, clean=False)
+
+            self._splitter = pysbd.Segmenter(
+                language=self._map_language(self.language),
+                clean=False,
+            )
         return self._splitter
 
     @staticmethod
     def _map_language(lang: str) -> str:
-        """Map language codes to pysbd-supported codes."""
         mapping = {
             'ja': 'ja',
             'jpn': 'ja',
@@ -40,61 +46,62 @@ class SentenceSplitter:
         }
         return mapping.get(lang, 'en')
 
-    def split(self, text: str) -> list[str]:
-        """Split *text* into sentences.
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        """Normalize extracted text before sentence splitting or audit."""
 
-        Returns a list of non-empty sentence strings.
-        Empty/whitespace-only segments are filtered out.
-        """
-        if not text or not text.strip():
+        if not text:
+            return ''
+        text = text.replace('\xa0', ' ').replace('\u3000', ' ')
+        text = text.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ')
+        text = _ZERO_WIDTH_RE.sub('', text)
+        text = _SPACE_RE.sub(' ', text)
+        return text.strip()
+
+    def split(self, text: str) -> list[str]:
+        """Split *text* into sentences and return non-empty normalized parts."""
+
+        normalized = self.normalize_text(text)
+        if not normalized:
             return []
 
         if self.language in ('ja', 'jpn', 'zh', 'zho'):
-            return self._split_cjk(text)
+            sentences = self._split_cjk(normalized)
+        else:
+            sentences = self._split_pysbd(normalized)
 
-        return self._split_pysbd(text)
+        cleaned = [self.normalize_text(sentence) for sentence in sentences]
+        return [sentence for sentence in cleaned if sentence]
 
     def _split_pysbd(self, text: str) -> list[str]:
-        """Split using pysbd."""
         splitter = self._get_splitter()
-        sentences = splitter.segment(text)
-        return [s for s in sentences if s.strip()]
+        return [segment for segment in splitter.segment(text) if segment.strip()]
 
     def _split_cjk(self, text: str) -> list[str]:
-        """Split CJK text on sentence-ending punctuation.
+        """Split CJK text while keeping trailing quotes/brackets with the sentence."""
 
-        Handles: 。！？ followed by optional closing quotes/brackets.
-        Falls back to pysbd for text without CJK punctuation.
-        """
-        # Pattern: sentence-ending punctuation + optional closing quotes
-        pattern = re.compile(
-            r'([。！？!?]'
-            r'[」』）\)】》〉"\']*'
-            r')'
-        )
-
-        parts = pattern.split(text)
-        if len(parts) <= 1:
-            # No CJK sentence-ending punctuation found, use pysbd
-            return self._split_pysbd(text)
-
-        # Reassemble: text + delimiter pairs
         sentences: list[str] = []
-        current = ''
-        for i, part in enumerate(parts):
-            current += part
-            # Odd indices are the delimiters (captured group)
-            if i % 2 == 1:
-                stripped = current.strip()
-                if stripped:
-                    sentences.append(stripped)
-                current = ''
+        start = 0
+        idx = 0
+        while idx < len(text):
+            char = text[idx]
+            if char not in _CJK_STOP_PUNCT:
+                idx += 1
+                continue
 
-        # Handle trailing text after last delimiter
-        if current.strip():
+            end = idx + 1
+            while end < len(text) and text[end] in _CJK_CLOSERS:
+                end += 1
+            candidate = text[start:end].strip()
+            if candidate:
+                sentences.append(candidate)
+            start = end
+            idx = end
+
+        tail = text[start:].strip()
+        if tail:
             if sentences:
-                sentences[-1] += current.rstrip()
+                sentences[-1] = f'{sentences[-1]} {tail}'.strip()
             else:
-                sentences.append(current.strip())
-
-        return [s for s in sentences if s.strip()]
+                sentences.append(tail)
+        return sentences

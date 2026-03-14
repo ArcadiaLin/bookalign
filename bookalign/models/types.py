@@ -1,38 +1,57 @@
-"""核心数据结构：Segment、AlignedPair、AlignmentResult。"""
+"""Core data structures for extraction and alignment."""
 
 from dataclasses import dataclass, field
 
 
 @dataclass
 class SpineItem:
-    """Spine 项的包装，记录 spine 序号和对应的 EpubHtml。"""
-    index: int                  # 在 spine 中的序号
-    item: object                # ebooklib.epub.EpubHtml
+    """Wrapper for an item in the book spine."""
+
+    index: int
+    item: object
+
+
+@dataclass
+class TextSpan:
+    """A readable text fragment and its source position in the XHTML tree."""
+
+    text: str
+    xpath: str
+    text_node_index: int
+    char_offset: int
+    source_kind: str = 'text'
+    cfi_text_node_index: int | None = None
+    cfi_exact: bool = False
 
 
 @dataclass
 class Segment:
-    """一个可参与对齐的文本单元（段落或句子）"""
-    text: str                   # 干净文本（过滤标签后的纯文本）
-    cfi: str                    # Range CFI: epubcfi(/6/N!/path,/start:off,/end:off)
-    chapter_idx: int            # 所属章节在 spine 中的序号
-    paragraph_idx: int          # 段落在章节内的序号
-    sentence_idx: int | None    # 句子在段落内的序号（段落级对齐时为 None）
-    raw_html: str = ''          # 原始 HTML 片段（用于输出时保留样式）
+    """A paragraph-level or sentence-level text unit used for alignment."""
+
+    text: str
+    cfi: str
+    chapter_idx: int
+    paragraph_idx: int
+    sentence_idx: int | None
+    raw_html: str = ''
+    element_xpath: str = ''
+    spans: list[TextSpan] = field(default_factory=list)
 
 
 @dataclass
 class AlignedPair:
-    """一组对齐结果"""
-    source: list[Segment]       # 原文（可能 1~N 个 Segment）
-    target: list[Segment]       # 译文（可能 1~M 个 Segment）
-    score: float                # 对齐置信度
+    """A group of aligned segments."""
+
+    source: list[Segment]
+    target: list[Segment]
+    score: float
 
 
 @dataclass
 class AlignmentResult:
-    """整本书的对齐结果"""
+    """Alignment result for a whole book."""
+
     pairs: list[AlignedPair]
     source_lang: str
     target_lang: str
-    granularity: str            # 'paragraph' | 'sentence'
+    granularity: str
