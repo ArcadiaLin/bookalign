@@ -7,8 +7,18 @@ import re
 
 _CJK_STOP_PUNCT = {'。', '！', '？', '!', '?'}
 _CJK_CLOSERS = {'」', '』', '）', ')', '】', '》', '"', "'", '’', '”'}
+_CJK_OPENERS = {'「', '『', '（', '【', '《', '"', "'", '‘', '“'}
 _ZERO_WIDTH_RE = re.compile(r'[\u200b\u200c\u200d\ufeff]')
 _SPACE_RE = re.compile(r'\s+')
+_DIALOGUE_TAG_RE = re.compile(
+    r'^[\s"“”\'‘’\(\[\-—]*(?:'
+    r'said|asked|replied|cried|murmured|whispered|answered|shouted|continued|'
+    r'dijo|pregunt[oó]|respondi[oó]|murmur[oó]|contest[oó]|replic[oó]|'
+    r'susurr[oó]|grit[oó]'
+    r')\b',
+    re.IGNORECASE,
+)
+_LOWERCASE_DIALOGUE_RE = re.compile(r'^[\s"“”\'‘’\(\[\-—]*[a-záéíóúñüç]', re.IGNORECASE)
 
 
 class SentenceSplitter:
@@ -68,7 +78,7 @@ class SentenceSplitter:
         if self.language in ('ja', 'jpn', 'zh', 'zho'):
             sentences = self._split_cjk(normalized)
         else:
-            sentences = self._split_pysbd(normalized)
+            sentences = self._merge_dialogue_segments(self._split_pysbd(normalized))
 
         cleaned = [self.normalize_text(sentence) for sentence in sentences]
         return [sentence for sentence in cleaned if sentence]
@@ -83,25 +93,75 @@ class SentenceSplitter:
         sentences: list[str] = []
         start = 0
         idx = 0
+        quote_depth = 0
         while idx < len(text):
             char = text[idx]
+            if char in _CJK_OPENERS:
+                quote_depth += 1
+            elif char in _CJK_CLOSERS and quote_depth > 0:
+                quote_depth -= 1
             if char not in _CJK_STOP_PUNCT:
                 idx += 1
                 continue
 
             end = idx + 1
+            consumed_closers = 0
             while end < len(text) and text[end] in _CJK_CLOSERS:
+                consumed_closers += 1
                 end += 1
+            if quote_depth > 0 and end == idx + 1:
+                idx += 1
+                continue
             candidate = text[start:end].strip()
             if candidate:
                 sentences.append(candidate)
+            if consumed_closers:
+                quote_depth = max(quote_depth - consumed_closers, 0)
             start = end
             idx = end
 
         tail = text[start:].strip()
         if tail:
             if sentences:
-                sentences[-1] = f'{sentences[-1]} {tail}'.strip()
+                sentences[-1] = f'{sentences[-1]}{tail}'.strip()
             else:
                 sentences.append(tail)
         return sentences
+
+    def _merge_dialogue_segments(self, segments: list[str]) -> list[str]:
+        if not segments:
+            return []
+
+        merged: list[str] = []
+        for segment in segments:
+            if (
+                merged
+                and (
+                    self._should_merge_with_previous(merged[-1], segment)
+                    or self._should_merge_colon_lead_in(merged[-1], segment)
+                )
+            ):
+                merged[-1] = f'{merged[-1]} {segment}'.strip()
+                continue
+            merged.append(segment)
+        return merged
+
+    def _should_merge_with_previous(self, previous: str, current: str) -> bool:
+        prev = previous.strip()
+        curr = current.strip()
+        if not prev or not curr:
+            return False
+        if prev.endswith(('"', '”', '’')) and (_DIALOGUE_TAG_RE.match(curr) or _LOWERCASE_DIALOGUE_RE.match(curr)):
+            return True
+        if curr in {'"', '”', '’', "''"}:
+            return True
+        return False
+
+    def _should_merge_colon_lead_in(self, previous: str, current: str) -> bool:
+        prev = previous.strip()
+        curr = current.strip()
+        if not prev or not curr:
+            return False
+        if prev.endswith(':') and curr[:1] in {'"', '“', '‘', '-', '—', '¿', '¡'}:
+            return True
+        return False

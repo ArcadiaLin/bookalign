@@ -11,12 +11,28 @@ pytest.importorskip('ebooklib')
 pytest.importorskip('lxml')
 pytest.importorskip('pysbd')
 
-from bookalign.epub.extractor import extract_segments, extract_text_from_cfi
-from bookalign.epub.reader import get_spine_documents, read_epub
-from bookalign.epub.cfi import parse_item_xml, resolve_cfi
-from bookalign.epub.sentence_splitter import SentenceSplitter
-from bookalign.epub.tag_filters import TagFilterConfig, _local_tag, should_skip_element
 from lxml import etree
+
+from bookalign.epub.cfi import parse_item_xml, resolve_cfi
+from bookalign.epub.debug_report import generate_report
+from bookalign.epub.extractor import (
+    _collect_text_spans,
+    _should_emit_segment,
+    collect_debug_spans,
+    extract_segments,
+    extract_text_from_cfi,
+)
+from bookalign.epub.reader import get_spine_documents, read_epub
+from bookalign.epub.sentence_splitter import SentenceSplitter
+from bookalign.epub.tag_filters import (
+    ExtractAction,
+    ElementPolicy,
+    TagFilterConfig,
+    _local_tag,
+    get_extract_action,
+    match_element_policy,
+    should_skip_element,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -61,6 +77,148 @@ FORBIDDEN_TEXT_PATTERNS = [
 ]
 
 
+def _xml_root(body: str):
+    parser = etree.XMLParser(recover=True)
+    return etree.fromstring(body, parser=parser)
+
+
+def test_tag_filter_matches_policy_actions():
+    root = _xml_root(
+        """
+        <html xmlns:epub="http://www.idpf.org/2007/ops">
+          <body>
+            <p><ruby>漢<rt>kan</rt><rp>(</rp>字</ruby><br/>続き</p>
+            <aside epub:type="footnote">note</aside>
+            <a class="noteref" href="#fn1">1</a>
+            <section><p>inner</p></section>
+          </body>
+        </html>
+        """
+    )
+    ruby = root.xpath('.//*[local-name()="ruby"]')[0]
+    rt = root.xpath('.//*[local-name()="rt"]')[0]
+    br = root.xpath('.//*[local-name()="br"]')[0]
+    aside = root.xpath('.//*[local-name()="aside"]')[0]
+    note_link = root.xpath('.//*[local-name()="a"]')[0]
+    section = root.xpath('.//*[local-name()="section"]')[0]
+
+    assert get_extract_action(ruby, TagFilterConfig()) == ExtractAction.KEEP_CHILDREN_ONLY
+    assert get_extract_action(rt, TagFilterConfig()) == ExtractAction.SKIP_ENTIRE
+    assert get_extract_action(br, TagFilterConfig()) == ExtractAction.INLINE_BREAK
+    assert get_extract_action(aside, TagFilterConfig()) == ExtractAction.SKIP_ENTIRE
+    assert get_extract_action(note_link, TagFilterConfig()) == ExtractAction.SKIP_ENTIRE
+    assert get_extract_action(section, TagFilterConfig()) == ExtractAction.STRUCTURAL_CONTAINER
+    assert match_element_policy(ruby, TagFilterConfig()).tag == 'ruby'
+
+
+def test_collect_text_spans_applies_policy_actions_consistently():
+    root = _xml_root(
+        """
+        <html xmlns:epub="http://www.idpf.org/2007/ops">
+          <body>
+            <p>甲<ruby>漢<rt>kan</rt><rp>(</rp>字</ruby><span class="super">注</span><a class="noteref" href="#fn1">1</a><strong>乙</strong><br/>丙</p>
+          </body>
+        </html>
+        """
+    )
+    paragraph = root.xpath('.//*[local-name()="p"]')[0]
+    spans = _collect_text_spans(paragraph, root.getroottree(), TagFilterConfig())
+
+    assert ''.join(span.text for span in spans).strip() == '甲漢字乙 丙'
+    assert all('注' not in span.text for span in spans)
+    assert all('1' not in span.text for span in spans)
+
+
+def test_collect_debug_spans_emits_debug_metadata():
+    root = _xml_root(
+        """
+        <html xmlns:epub="http://www.idpf.org/2007/ops">
+          <body>
+            <p>甲<ruby>漢<rt>kan</rt>字</ruby><br/>乙</p>
+          </body>
+        </html>
+        """
+    )
+    paragraph = root.xpath('.//*[local-name()="p"]')[0]
+    debug_spans = collect_debug_spans(paragraph, TagFilterConfig())
+
+    assert debug_spans
+    assert any(span.action == 'KEEP_CHILDREN_ONLY' for span in debug_spans)
+    assert any(span.action == 'INLINE_BREAK' for span in debug_spans)
+
+
+def test_custom_policy_supports_direct_text_only():
+    config = TagFilterConfig(
+        policies=[
+            ElementPolicy(tag='span', classes=frozenset({'dropcap'}), action=ExtractAction.KEEP_DIRECT_TEXT_ONLY, name='dropcap'),
+        ],
+    )
+    root = _xml_root(
+        """
+        <html>
+          <body>
+            <p><span class="dropcap">A<i>x</i></span>bc</p>
+          </body>
+        </html>
+        """
+    )
+    paragraph = root.xpath('.//*[local-name()="p"]')[0]
+    spans = _collect_text_spans(paragraph, root.getroottree(), config)
+
+    assert ''.join(span.text for span in spans).strip() == 'Abc'
+
+
+def test_collect_text_spans_drops_numeric_break_markers():
+    root = _xml_root(
+        """
+        <html>
+          <body>
+            <p>第一句<br/>3<br/>第二句</p>
+          </body>
+        </html>
+        """
+    )
+    paragraph = root.xpath('.//*[local-name()="p"]')[0]
+    spans = _collect_text_spans(paragraph, root.getroottree(), TagFilterConfig())
+    assert ''.join(span.text for span in spans).strip() == '第一句 第二句'
+
+
+def test_should_emit_segment_skips_obvious_noise_and_headings():
+    config = TagFilterConfig()
+    root = _xml_root(
+        """
+        <html>
+          <body>
+            <p id="license-note">Project Gutenberg trademark license fee</p>
+            <h1>CHAPTER I</h1>
+            <p>这是正常的正文句子。</p>
+          </body>
+        </html>
+        """
+    )
+    noisy = root.xpath('.//*[local-name()="p"]')[0]
+    heading = root.xpath('.//*[local-name()="h1"]')[0]
+    body = root.xpath('.//*[local-name()="p"]')[1]
+    assert _should_emit_segment(noisy, 'Project Gutenberg trademark license fee', '<p>...</p>', config) is False
+    assert _should_emit_segment(heading, 'CHAPTER I', '<h1>CHAPTER I</h1>', config) is False
+    assert _should_emit_segment(body, '这是正常的正文句子。', '<p>这是正常的正文句子。</p>', config) is True
+
+
+def test_collect_text_spans_inserts_space_between_latin_inline_fragments():
+    root = _xml_root(
+        """
+        <html>
+          <body>
+            <p><span>works.</span><span>Despite these efforts</span></p>
+          </body>
+        </html>
+        """
+    )
+    paragraph = root.xpath('.//*[local-name()="p"]')[0]
+    spans = _collect_text_spans(paragraph, root.getroottree(), TagFilterConfig())
+    assert ''.join(span.text for span in spans).strip() == 'works. Despite these efforts'
+
+
 def _book_path(pattern: str) -> Path:
     matches = sorted(BOOKS_DIR.glob(pattern))
     assert matches, f'No EPUB found for pattern: {pattern}'
@@ -81,38 +239,17 @@ def _is_meaningful_candidate(node, config: TagFilterConfig) -> bool:
         return False
     if should_skip_element(node, config):
         return False
-    if _local_tag(node.tag) == 'div':
-        direct_blocks = [
-            child for child in node
-            if isinstance(child.tag, str)
-            and _local_tag(child.tag) in config.block_tags
-            and not should_skip_element(child, config)
-        ]
-        if len(direct_blocks) >= 2:
-            return False
+    if get_extract_action(node, config) != ExtractAction.BLOCK_BREAK:
+        return False
+    raw_html = etree.tostring(node, encoding='unicode', method='html')
+    if not _should_emit_segment(node, text, raw_html, config):
+        return False
     return True
 
 
 def _expected_readable_text(node, config: TagFilterConfig) -> str:
-    parts: list[str] = []
-
-    def walk(element):
-        if should_skip_element(element, config):
-            return
-        if element.text:
-            parts.append(element.text)
-        for child in element:
-            if not isinstance(child.tag, str):
-                if child.tail:
-                    parts.append(child.tail)
-                continue
-            if not should_skip_element(child, config) and _local_tag(child.tag) not in config.block_tags:
-                walk(child)
-            if child.tail:
-                parts.append(child.tail)
-
-    walk(node)
-    return SentenceSplitter.normalize_text(''.join(parts))
+    text = ''.join(span.text for span in _collect_text_spans(node, node.getroottree(), config))
+    return SentenceSplitter.normalize_text(text)
 
 
 def _select_sample_nodes(book, book_path: Path, config: TagFilterConfig) -> list[tuple[int, object, object]]:
@@ -195,7 +332,9 @@ def test_extract_segments_audits_complex_multilingual_epubs():
 
             resolved = resolve_cfi(paragraph_segment.cfi, book)
             assert resolved is not None, f'Unable to resolve CFI for {doc_name}'
-            assert extract_text_from_cfi(book, paragraph_segment.cfi, config=config)
+            roundtrip = extract_text_from_cfi(book, paragraph_segment.cfi, config=config)
+            assert roundtrip
+            assert roundtrip == paragraph_segment.text
 
             joiner = '' if language in {'ja', 'zh'} else ' '
             reconstructed = SentenceSplitter.normalize_text(
@@ -223,3 +362,22 @@ def test_extract_segments_audits_complex_multilingual_epubs():
             )
 
     _append_audit_rows(audit_rows)
+
+
+@pytest.mark.integration
+def test_debug_report_generator_outputs_markdown(tmp_path):
+    report = generate_report(
+        book_query='kinkaku.epub',
+        seed=20260315,
+        sample_count=2,
+        test_type='mixed',
+        granularity='sentence',
+        language='ja',
+        include_debug=True,
+    )
+    output = tmp_path / 'report.md'
+    output.write_text(report, encoding='utf-8')
+
+    assert '# EPUB Extraction Audit' in report
+    assert '## Samples' in report
+    assert '#### Debug Spans' in report

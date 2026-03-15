@@ -25,6 +25,17 @@ class TextSpan:
 
 
 @dataclass
+class DebugSpan:
+    """Debug-only span metadata for inspection and reports."""
+
+    xpath: str
+    tag: str
+    text_preview: str
+    action: str = ''
+    policy_name: str = ''
+
+
+@dataclass
 class Segment:
     """A paragraph-level or sentence-level text unit used for alignment."""
 

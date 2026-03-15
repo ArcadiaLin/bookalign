@@ -33,3 +33,27 @@ def test_sentence_splitter_rejoins_to_normalized_text(text):
     normalized = SentenceSplitter.normalize_text(text)
     sentences = splitter.split(text)
     assert SentenceSplitter.normalize_text(' '.join(sentences)) == normalized
+
+
+def test_cjk_tail_is_attached_without_inserting_space():
+    splitter = SentenceSplitter('ja')
+    text = '本能寺は天正十年の兵火に焼かれた。……'
+    assert splitter.split(text) == ['本能寺は天正十年の兵火に焼かれた。……']
+
+
+def test_cjk_dialogue_inside_quotes_is_not_oversplit():
+    splitter = SentenceSplitter('zh')
+    text = '时光机却紧急传来了信息：“嘀！警报警报！有入侵者正试图解体———————”'
+    assert splitter.split(text) == ['时光机却紧急传来了信息：“嘀！警报警报！有入侵者正试图解体———————”']
+
+
+def test_latin_dialogue_tag_is_merged_back():
+    splitter = SentenceSplitter('en')
+    text = '"Stop!" said Alice.'
+    assert splitter.split(text) == ['"Stop!" said Alice.']
+
+
+def test_latin_colon_lead_in_is_merged_with_quote():
+    splitter = SentenceSplitter('es')
+    text = 'Le dijo: "Ven conmigo."'
+    assert splitter.split(text) == ['Le dijo: "Ven conmigo."']
