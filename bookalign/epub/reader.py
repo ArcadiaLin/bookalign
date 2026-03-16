@@ -18,9 +18,18 @@ def get_spine_documents(book: epub.EpubBook) -> list[tuple[int, epub.EpubHtml]]:
     """
     results: list[tuple[int, epub.EpubHtml]] = []
     for i, entry in enumerate(book.spine):
-        item_id = entry[0] if isinstance(entry, tuple) else entry
-        item = book.get_item_with_id(item_id)
-        if item is not None and item.get_type() == ebooklib.ITEM_DOCUMENT:
+        item = None
+        if isinstance(entry, tuple):
+            item = book.get_item_with_id(entry[0])
+        elif hasattr(entry, 'get_type'):
+            item = entry
+        else:
+            item = book.get_item_with_id(entry)
+        if (
+            item is not None
+            and item.get_type() == ebooklib.ITEM_DOCUMENT
+            and not isinstance(item, epub.EpubNav)
+        ):
             results.append((i, item))
     return results
 

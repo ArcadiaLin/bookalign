@@ -10,7 +10,19 @@ dependencies = [
     "pysbd>=0.3.4",
 ]
 
+[project.scripts]
+bookalign = "bookalign.cli:main"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+]
+align = [
+    "faiss-cpu>=1.8",
+    "googletrans==4.0.0rc1",
+    "numba>=0.59",
+    "numpy>=1.26",
+    "sentence-splitter>=1.4",
+    "sentence-transformers>=3.0",
+    "torch>=2.2",
 ]

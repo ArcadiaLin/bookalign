@@ -1,60 +1,50 @@
-"""双语 EPUB 重建与输出。
-
-将对齐结果注入到原书结构中，生成双语对照 EPUB。
-"""
+"""Build a sentence-aligned bilingual EPUB."""
 
 from __future__ import annotations
 
-import copy
+from collections import defaultdict
+import html
 from pathlib import Path
 
-import ebooklib
 from ebooklib import epub
-from lxml import etree
 
-from bookalign.models.types import AlignmentResult, AlignedPair, Segment
-from bookalign.epub.cfi import (
-    CFIParser,
-    resolve_spine_item,
-    parse_item_xml,
-    _merge_paths,
-    resolve_dom_steps,
-    _normalize_spine_entry,
-)
-from bookalign.epub.reader import get_spine_documents
-
-
-# ═══════════════════════════════ CSS styles ═══════════════════════════════════
+from bookalign.epub.reader import get_metadata, get_spine_documents
+from bookalign.models.types import AlignmentResult, AlignedPair
 
 _BILINGUAL_CSS = """\
-.bilingual-pair {
-  margin: 1em 0;
+body {
+  font-family: serif;
+  line-height: 1.7;
+  margin: 0;
+  padding: 0 1rem 2rem;
 }
-.bilingual-pair .source {
-  margin-bottom: 0.3em;
+h1 {
+  font-size: 1.4rem;
+  margin: 1.5rem 0 1rem;
 }
-.bilingual-pair .translation {
-  color: #555;
-  font-size: 0.95em;
-  margin-top: 0;
-  padding-left: 0.5em;
-  border-left: 2px solid #ccc;
+.paragraph-block {
+  margin: 1.25rem 0 1.75rem;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid #e2e2e2;
 }
 .sentence-pair {
-  margin: 0.5em 0;
+  margin: 0.65rem 0;
 }
-.sentence-pair .src-sent {
-  margin: 0 0 0.1em 0;
+.source-sentence {
+  margin: 0 0 0.15rem;
+  font-size: 1rem;
 }
-.sentence-pair .tgt-sent {
+.target-sentence {
+  margin: 0 0 0 1rem;
   color: #555;
-  font-size: 0.93em;
-  margin: 0 0 0.3em 0.5em;
+  font-size: 0.96rem;
+}
+.empty-target {
+  font-style: italic;
+  opacity: 0.72;
 }
 """
 
-
-# ═══════════════════════════════ Main builder ═════════════════════════════════
 
 def build_bilingual_epub(
     alignment: AlignmentResult,
@@ -62,245 +52,141 @@ def build_bilingual_epub(
     target_book: epub.EpubBook,
     output_path: Path,
 ) -> None:
-    """Build a bilingual EPUB from alignment results.
+    """Build a generated bilingual EPUB from sentence alignment results."""
 
-    Strategy:
-    1. Copy the source book structure (metadata, CSS, images, TOC).
-    2. Inject bilingual CSS.
-    3. For each aligned chapter, insert translation after source paragraphs.
-    4. Write the result to *output_path*.
-    """
+    output_path = Path(output_path)
     out_book = epub.EpubBook()
 
-    # Copy metadata
-    _copy_metadata(source_book, out_book)
+    _copy_metadata(source_book, target_book, out_book)
 
-    # Add bilingual CSS
     css_item = epub.EpubItem(
         uid='bilingual-css',
-        file_name='style/bilingual.css',
+        file_name='styles/bilingual.css',
         media_type='text/css',
         content=_BILINGUAL_CSS.encode('utf-8'),
     )
     out_book.add_item(css_item)
 
-    # Copy non-document items (CSS, images, fonts)
-    for item in source_book.get_items():
-        if item.get_type() != ebooklib.ITEM_DOCUMENT:
-            out_book.add_item(item)
-
-    # Group alignment pairs by chapter
-    pairs_by_chapter: dict[int, list[AlignedPair]] = {}
+    source_docs = {spine_idx: doc for spine_idx, doc in get_spine_documents(source_book)}
+    pairs_by_chapter: dict[int, list[AlignedPair]] = defaultdict(list)
     for pair in alignment.pairs:
-        if pair.source:
-            ch_idx = pair.source[0].chapter_idx
-            pairs_by_chapter.setdefault(ch_idx, []).append(pair)
+        chapter_idx = _pair_source_chapter(pair)
+        if chapter_idx is None:
+            continue
+        pairs_by_chapter[chapter_idx].append(pair)
 
-    # Process each spine document
-    spine_docs = get_spine_documents(source_book)
-    new_spine: list[tuple[str, str]] = []
-
-    for spine_idx, doc in spine_docs:
-        chapter_pairs = pairs_by_chapter.get(spine_idx, [])
-
-        if chapter_pairs:
-            new_content = _inject_translations(
-                doc, chapter_pairs, alignment.granularity
-            )
-        else:
-            new_content = doc.get_content()
-
-        new_item = epub.EpubHtml(
-            title=getattr(doc, 'title', ''),
-            file_name=doc.get_name(),
-            lang=getattr(doc, 'lang', None),
+    chapter_items: list[epub.EpubHtml] = []
+    for chapter_idx in sorted(pairs_by_chapter):
+        doc = source_docs.get(chapter_idx)
+        chapter_title = _chapter_title(doc, chapter_idx)
+        chapter_html = _build_chapter_html(
+            chapter_title=chapter_title,
+            pairs=pairs_by_chapter[chapter_idx],
         )
-        new_item.set_content(new_content)
-        new_item.add_item(css_item)
-        out_book.add_item(new_item)
-        new_spine.append((new_item.get_id(), 'yes'))
 
-    out_book.spine = new_spine
+        chapter_item = epub.EpubHtml(
+            title=chapter_title,
+            file_name=f'chapters/chapter_{chapter_idx:04d}.xhtml',
+            lang=alignment.source_lang,
+        )
+        chapter_item.set_content(chapter_html)
+        chapter_item.add_item(css_item)
+        out_book.add_item(chapter_item)
+        chapter_items.append(chapter_item)
 
-    # Copy TOC structure
-    out_book.toc = source_book.toc
-
-    # Add navigation files
+    out_book.toc = tuple(chapter_items)
+    out_book.spine = ['nav', *chapter_items]
     out_book.add_item(epub.EpubNcx())
     out_book.add_item(epub.EpubNav())
 
     epub.write_epub(str(output_path), out_book)
 
 
-# ═══════════════════════════ Translation injection ═══════════════════════════
+def _copy_metadata(
+    source_book: epub.EpubBook,
+    target_book: epub.EpubBook,
+    out_book: epub.EpubBook,
+) -> None:
+    source_meta = get_metadata(source_book)
+    target_meta = get_metadata(target_book)
 
-def _inject_translations(
-    doc: epub.EpubHtml,
+    identifier = source_meta['title'] or 'bookalign-output'
+    out_book.set_identifier(f'{identifier}-sentence-aligned')
+
+    source_title = source_meta['title'] or 'Source Book'
+    target_title = target_meta['title'] or 'Target Book'
+    out_book.set_title(f'{source_title} / {target_title}')
+    out_book.set_language(source_meta['language'] or 'zh')
+
+    author = source_meta['author'] or target_meta['author']
+    if author:
+        out_book.add_author(author)
+
+
+def _build_chapter_html(
+    *,
+    chapter_title: str,
     pairs: list[AlignedPair],
-    granularity: str,
-) -> bytes:
-    """Inject translation content into a chapter's XHTML.
+) -> str:
+    paragraphs: dict[int, list[AlignedPair]] = defaultdict(list)
+    for pair in sorted(pairs, key=_pair_sort_key):
+        para_idx = _pair_paragraph_index(pair)
+        paragraphs[para_idx].append(pair)
 
-    For each aligned pair, finds the source paragraph in the DOM using its
-    CFI and inserts translation content after it.
-    """
-    root = parse_item_xml(doc)
+    body_parts = [f'<h1>{html.escape(chapter_title)}</h1>']
+    for paragraph_idx in sorted(paragraphs):
+        body_parts.append('<section class="paragraph-block">')
+        for pair in paragraphs[paragraph_idx]:
+            source_text = _join_segment_texts(pair.source)
+            target_text = _join_segment_texts(pair.target)
+            target_class = 'target-sentence empty-target' if not target_text else 'target-sentence'
+            target_text = target_text or '[未对齐]'
+            body_parts.append(
+                ''.join(
+                    [
+                        '<div class="sentence-pair">',
+                        f'<p class="source-sentence">{html.escape(source_text)}</p>',
+                        f'<p class="{target_class}">{html.escape(target_text)}</p>',
+                        '</div>',
+                    ]
+                )
+            )
+        body_parts.append('</section>')
 
-    # Build a map: element -> list of (pair, position) for insertion
-    # We process pairs in reverse order to avoid offset issues
-    insertions: list[tuple[etree._Element, AlignedPair]] = []
-
-    for pair in pairs:
-        if not pair.source or not pair.source[0].cfi:
-            continue
-
-        source_elem = _resolve_cfi_to_element(pair.source[0].cfi, root)
-        if source_elem is not None:
-            insertions.append((source_elem, pair))
-
-    # Insert translations after their source elements
-    for source_elem, pair in reversed(insertions):
-        parent = source_elem.getparent()
-        if parent is None:
-            continue
-
-        idx = list(parent).index(source_elem)
-        ns = _get_namespace(root)
-
-        if granularity == 'sentence':
-            container = _build_sentence_pair_html(pair, ns)
-        else:
-            container = _build_paragraph_pair_html(pair, ns)
-
-        # Insert after the source element
-        parent.insert(idx + 1, container)
-
-    # Add bilingual CSS link to head
-    _add_css_link(root)
-
-    return etree.tostring(
-        root, encoding='unicode', method='xml', xml_declaration=True
-    ).encode('utf-8')
+    return ''.join(body_parts)
 
 
-def _resolve_cfi_to_element(cfi_str: str, root) -> etree._Element | None:
-    """Resolve a CFI string to the target element in an already-parsed DOM.
-
-    Since we already have the root, we only need the redirect portion
-    of the CFI to navigate the DOM.
-    """
-    parsed = CFIParser().parse_epubcfi(cfi_str)
-    parent_path = parsed.get('parent', {})
-    redirect = parent_path.get('redirect')
-
-    if not redirect:
-        return None
-
-    result = resolve_dom_steps(root, redirect)
-    if result is None:
-        return None
-
-    return result.get('node')
+def _chapter_title(doc: epub.EpubHtml | None, chapter_idx: int) -> str:
+    if doc is None:
+        return f'Chapter {chapter_idx + 1}'
+    title = getattr(doc, 'title', '') or ''
+    if title:
+        return title
+    name = doc.get_name().rsplit('/', 1)[-1]
+    return name or f'Chapter {chapter_idx + 1}'
 
 
-def _get_namespace(root) -> str:
-    """Extract the XHTML namespace from the root element."""
-    tag = root.tag
-    if isinstance(tag, str) and tag.startswith('{'):
-        return tag.split('}')[0] + '}'
-    return ''
+def _pair_sort_key(pair: AlignedPair) -> tuple[int, int, int]:
+    chapter_idx = _pair_source_chapter(pair) or 0
+    paragraph_idx = _pair_paragraph_index(pair)
+    sentence_idx = min(
+        (segment.sentence_idx or 0 for segment in pair.source),
+        default=0,
+    )
+    return chapter_idx, paragraph_idx, sentence_idx
 
 
-def _build_paragraph_pair_html(
-    pair: AlignedPair, ns: str
-) -> etree._Element:
-    """Build a bilingual pair container for paragraph-level alignment."""
-    container = etree.Element(f'{ns}div')
-    container.set('class', 'bilingual-pair')
-
-    # Source text
-    src_div = etree.SubElement(container, f'{ns}div')
-    src_div.set('class', 'source')
-    source_text = ' '.join(s.text for s in pair.source)
-    src_div.text = source_text
-
-    # Translation text
-    tgt_div = etree.SubElement(container, f'{ns}div')
-    tgt_div.set('class', 'translation')
-    target_text = ' '.join(s.text for s in pair.target)
-    tgt_div.text = target_text
-
-    return container
+def _pair_source_chapter(pair: AlignedPair) -> int | None:
+    if pair.source:
+        return min(segment.chapter_idx for segment in pair.source)
+    return None
 
 
-def _build_sentence_pair_html(
-    pair: AlignedPair, ns: str
-) -> etree._Element:
-    """Build sentence-level bilingual pairs."""
-    container = etree.Element(f'{ns}div')
-    container.set('class', 'bilingual-pair')
-
-    for src_seg in pair.source:
-        # Find corresponding target segments (same sentence_idx if available)
-        sent_div = etree.SubElement(container, f'{ns}div')
-        sent_div.set('class', 'sentence-pair')
-
-        src_p = etree.SubElement(sent_div, f'{ns}p')
-        src_p.set('class', 'src-sent')
-        src_p.text = src_seg.text
-
-    # Add all target segments
-    for tgt_seg in pair.target:
-        sent_div = etree.SubElement(container, f'{ns}div')
-        sent_div.set('class', 'sentence-pair')
-
-        tgt_p = etree.SubElement(sent_div, f'{ns}p')
-        tgt_p.set('class', 'tgt-sent')
-        tgt_p.text = tgt_seg.text
-
-    return container
+def _pair_paragraph_index(pair: AlignedPair) -> int:
+    if pair.source:
+        return min(segment.paragraph_idx for segment in pair.source)
+    return -1
 
 
-def _add_css_link(root) -> None:
-    """Add a <link> to bilingual.css in the <head> of the document."""
-    ns = _get_namespace(root)
-
-    # Find <head>
-    head = root.find(f'{ns}head')
-    if head is None:
-        # Try without namespace
-        head = root.find('head')
-    if head is None:
-        return
-
-    link = etree.SubElement(head, f'{ns}link')
-    link.set('rel', 'stylesheet')
-    link.set('type', 'text/css')
-    link.set('href', 'style/bilingual.css')
-
-
-def _copy_metadata(src_book: epub.EpubBook, dst_book: epub.EpubBook) -> None:
-    """Copy basic metadata from source to destination book."""
-    # Identifier
-    identifiers = src_book.get_metadata('DC', 'identifier')
-    if identifiers:
-        val = identifiers[0][0] if isinstance(identifiers[0], tuple) else identifiers[0]
-        dst_book.set_identifier(val + '-bilingual')
-    else:
-        dst_book.set_identifier('bilingual-epub')
-
-    # Title
-    titles = src_book.get_metadata('DC', 'title')
-    if titles:
-        val = titles[0][0] if isinstance(titles[0], tuple) else titles[0]
-        dst_book.set_title(f'{val} (Bilingual)')
-    else:
-        dst_book.set_title('Bilingual Edition')
-
-    # Language
-    languages = src_book.get_metadata('DC', 'language')
-    if languages:
-        val = languages[0][0] if isinstance(languages[0], tuple) else languages[0]
-        dst_book.set_language(val)
-    else:
-        dst_book.set_language('en')
+def _join_segment_texts(segments) -> str:
+    return ' '.join(segment.text.strip() for segment in segments if segment.text.strip())

@@ -1,9 +1,5 @@
 import numpy as np
 
-from bertalign import model
-from bertalign.corelib import *
-from bertalign.utils import *
-
 class Bertalign:
     def __init__(self,
                  src,
@@ -15,7 +11,10 @@ class Bertalign:
                  margin=True,
                  len_penalty=True,
                  is_split=False,
+                 src_lang=None,
+                 tgt_lang=None,
                ):
+        from bertalign.utils import LANG, clean_text, detect_lang, split_sents
         
         self.max_align = max_align
         self.top_k = top_k
@@ -26,8 +25,8 @@ class Bertalign:
         
         src = clean_text(src)
         tgt = clean_text(tgt)
-        src_lang = detect_lang(src)
-        tgt_lang = detect_lang(tgt)
+        src_lang = src_lang or detect_lang(src)
+        tgt_lang = tgt_lang or detect_lang(tgt)
         
         if is_split:
             src_sents = src.splitlines()
@@ -45,6 +44,9 @@ class Bertalign:
         print("Source language: {}, Number of sentences: {}".format(src_lang, src_num))
         print("Target language: {}, Number of sentences: {}".format(tgt_lang, tgt_num))
 
+        import bertalign
+
+        model = bertalign.get_model()
         print("Embedding source and target text using {} ...".format(model.model_name))
         src_vecs, src_lens = model.transform(src_sents, max_align - 1)
         tgt_vecs, tgt_lens = model.transform(tgt_sents, max_align - 1)
@@ -64,6 +66,16 @@ class Bertalign:
         self.tgt_vecs = tgt_vecs
         
     def align_sents(self):
+        from bertalign.corelib import (
+            find_top_k_sents,
+            get_alignment_types,
+            find_first_search_path,
+            first_pass_align,
+            first_back_track,
+            find_second_search_path,
+            second_pass_align,
+            second_back_track,
+        )
 
         print("Performing first-step alignment ...")
         D, I = find_top_k_sents(self.src_vecs[0,:], self.tgt_vecs[0,:], k=self.top_k)

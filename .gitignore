@@ -5,5 +5,10 @@ __pycache__/
 .idea
 *~
 .pytest_cache/
-venv/
+.venv/
+.cache/
 *.xhtml
+
+# Local test inputs / downloaded models
+books/
+*.epub
