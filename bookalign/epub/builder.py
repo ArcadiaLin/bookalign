@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass, field
 import html
 from pathlib import Path, PurePosixPath
@@ -13,8 +14,18 @@ from ebooklib import epub
 from lxml import etree
 
 from bookalign.epub.cfi import parse_item_xml, resolve_cfi
+from bookalign.epub.extractor import (
+    _build_span_boundaries,
+    _iter_readable_text_parts,
+    _needs_inter_span_space,
+    _normalize_fragment,
+    _should_drop_standalone_span,
+    _trim_spans,
+)
 from bookalign.epub.reader import get_metadata, get_spine_documents
-from bookalign.models.types import AlignmentResult, AlignedPair
+from bookalign.epub.sentence_splitter import SentenceSplitter
+from bookalign.epub.tag_filters import TagFilterConfig
+from bookalign.models.types import AlignmentResult, AlignedPair, Segment, TextSpan
 
 _BILINGUAL_CSS = """\
 body {
@@ -56,6 +67,16 @@ _GENERATED_CHAPTER_NAME_RE = re.compile(
 )
 _PRESERVED_BLOCK_TAGS = frozenset({'p', 'li', 'blockquote', 'dd', 'dt', 'figcaption', 'pre'})
 _CJK_LANGS = frozenset({'zh', 'ja', 'ko'})
+_VERTICAL_TO_HORIZONTAL_PUNCTUATION = str.maketrans({
+    '︽': '《',
+    '︾': '》',
+    '︿': '〈',
+    '﹀': '〉',
+    '﹁': '「',
+    '﹂': '」',
+    '﹃': '『',
+    '﹄': '』',
+})
 
 
 @dataclass
@@ -65,6 +86,39 @@ class _ParagraphInjection:
     paragraph_cfi: str
     sequence: int
     target_texts: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SourceLayoutBuilderConfig:
+    source_lang: str
+    target_lang: str
+    writeback_mode: str = 'paragraph'
+    layout_direction: str = 'horizontal'
+    emit_translation_metadata: bool = False
+    normalize_vertical_punctuation: bool = True
+
+
+@dataclass
+class _InlineSentenceUnit:
+    source_segments: list[Segment]
+    target_text: str
+    sequence: int
+
+
+@dataclass
+class _InlineParagraphRewrite:
+    chapter_idx: int
+    paragraph_idx: int
+    paragraph_cfi: str
+    sequence: int
+    units: list[_InlineSentenceUnit] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _TextSlotKey:
+    owner_path: tuple[int, ...]
+    source_kind: str
+    text_node_index: int
 
 
 def _source_layout_css(layout_direction: str) -> str:
@@ -181,8 +235,10 @@ def build_bilingual_epub_on_source_layout(
     target_book: epub.EpubBook,
     output_path: Path,
     *,
+    writeback_mode: str = 'paragraph',
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
+    normalize_vertical_punctuation: bool = True,
 ) -> None:
     """Write translations back into the source EPUB layout using source CFI anchors.
 
@@ -193,6 +249,17 @@ def build_bilingual_epub_on_source_layout(
     output_path = Path(output_path)
     if layout_direction not in {'horizontal', 'source'}:
         raise ValueError(f'Unsupported layout_direction: {layout_direction}')
+    if writeback_mode not in {'paragraph', 'inline'}:
+        raise ValueError(f'Unsupported writeback_mode: {writeback_mode}')
+
+    config = SourceLayoutBuilderConfig(
+        source_lang=alignment.source_lang,
+        target_lang=alignment.target_lang,
+        writeback_mode=writeback_mode,
+        layout_direction=layout_direction,
+        emit_translation_metadata=emit_translation_metadata,
+        normalize_vertical_punctuation=normalize_vertical_punctuation,
+    )
     css_item = _ensure_css_item(
         source_book,
         uid='bookalign-source-layout-css',
@@ -214,39 +281,13 @@ def build_bilingual_epub_on_source_layout(
         _preserve_document_head(doc, root)
         _attach_stylesheet_link(doc, css_item.file_name)
 
-    for chapter_idx, injections in injections_by_chapter.items():
-        doc = docs.get(chapter_idx)
-        if doc is None:
-            continue
-
-        root = _parse_raw_document_xml(doc)
-        _normalize_layout_root(root, layout_direction=layout_direction)
-        changed = False
-        for injection in sorted(
-            injections,
-            key=lambda item: (item.paragraph_idx, item.sequence),
-            reverse=True,
-        ):
-            if _inject_translation_block(
-                root=root,
-                book=source_book,
-                injection=injection,
-                target_lang=alignment.target_lang,
-                emit_translation_metadata=emit_translation_metadata,
-            ):
-                changed = True
-
-        if not changed:
-            continue
-
-        doc.set_content(
-            etree.tostring(
-                root,
-                encoding='utf-8',
-                xml_declaration=True,
-                pretty_print=True,
-            )
-        )
+    strategy = _resolve_source_layout_strategy(config)
+    strategy(
+        alignment=alignment,
+        source_book=source_book,
+        docs=docs,
+        config=config,
+    )
 
     _ensure_navigation_items(source_book)
     epub.write_epub(str(output_path), source_book)
@@ -322,6 +363,91 @@ def _collect_paragraph_injections(
     return injections_by_chapter
 
 
+def _resolve_source_layout_strategy(config: SourceLayoutBuilderConfig):
+    language = config.source_lang.split('-', 1)[0].casefold()
+    strategies = {
+        ('ja', 'paragraph'): _apply_paragraph_source_layout,
+        ('ja', 'inline'): _apply_inline_source_layout,
+        ('*', 'paragraph'): _apply_paragraph_source_layout,
+        ('*', 'inline'): _apply_inline_source_layout,
+    }
+    return strategies.get((language, config.writeback_mode)) or strategies[('*', config.writeback_mode)]
+
+
+def _apply_paragraph_source_layout(
+    *,
+    alignment: AlignmentResult,
+    source_book: epub.EpubBook,
+    docs: dict[int, epub.EpubHtml],
+    config: SourceLayoutBuilderConfig,
+) -> None:
+    injections_by_chapter = _collect_paragraph_injections(
+        alignment,
+        target_lang=config.target_lang,
+    )
+    for chapter_idx, injections in injections_by_chapter.items():
+        doc = docs.get(chapter_idx)
+        if doc is None:
+            continue
+
+        root = _parse_raw_document_xml(doc)
+        _normalize_layout_root(root, layout_direction=config.layout_direction)
+        changed = False
+        for injection in sorted(
+            injections,
+            key=lambda item: (item.paragraph_idx, item.sequence),
+            reverse=True,
+        ):
+            if _inject_translation_block(
+                root=root,
+                book=source_book,
+                injection=injection,
+                config=config,
+            ):
+                changed = True
+
+        if changed:
+            _set_document_content(doc, root)
+
+
+def _apply_inline_source_layout(
+    *,
+    alignment: AlignmentResult,
+    source_book: epub.EpubBook,
+    docs: dict[int, epub.EpubHtml],
+    config: SourceLayoutBuilderConfig,
+) -> None:
+    rewrites_by_chapter = _collect_inline_paragraph_rewrites(
+        alignment,
+        target_lang=config.target_lang,
+    )
+    tag_config = TagFilterConfig()
+    for chapter_idx, rewrites in rewrites_by_chapter.items():
+        doc = docs.get(chapter_idx)
+        if doc is None:
+            continue
+
+        root = _parse_raw_document_xml(doc)
+        _normalize_layout_root(root, layout_direction=config.layout_direction)
+        changed = False
+        for rewrite in sorted(
+            rewrites,
+            key=lambda item: (item.paragraph_idx, item.sequence),
+            reverse=True,
+        ):
+            if _rewrite_inline_paragraph(
+                root=root,
+                book=source_book,
+                rewrite=rewrite,
+                config=config,
+                tag_config=tag_config,
+            ):
+                changed = True
+
+        if changed:
+            _set_document_content(doc, root)
+
+
 def _append_translation_text(target_texts: list[str], text: str) -> None:
     normalized = text.strip()
     if normalized:
@@ -337,13 +463,108 @@ def _join_translation_texts(target_texts: list[str], target_lang: str) -> str:
     return joiner.join(normalized)
 
 
+def _collect_inline_paragraph_rewrites(
+    alignment: AlignmentResult,
+    *,
+    target_lang: str,
+) -> dict[int, list[_InlineParagraphRewrite]]:
+    buckets: dict[tuple[int, int], _InlineParagraphRewrite] = {}
+    pending_target_only: list[str] = []
+    last_key: tuple[int, int] | None = None
+    sequence = 0
+
+    for pair in alignment.pairs:
+        target_text = _join_segment_texts(pair.target)
+        source_segments = sorted(
+            pair.source,
+            key=lambda segment: (
+                segment.chapter_idx,
+                segment.paragraph_idx,
+                segment.sentence_idx or 0,
+            ),
+        )
+        if source_segments:
+            anchor = source_segments[0]
+            key = (anchor.chapter_idx, anchor.paragraph_idx)
+            rewrite = buckets.setdefault(
+                key,
+                _InlineParagraphRewrite(
+                    chapter_idx=anchor.chapter_idx,
+                    paragraph_idx=anchor.paragraph_idx,
+                    paragraph_cfi=anchor.paragraph_cfi or anchor.cfi,
+                    sequence=sequence,
+                ),
+            )
+            if pending_target_only:
+                pending_text = _join_translation_texts(pending_target_only, target_lang)
+                if rewrite.units:
+                    rewrite.units[-1].target_text = _join_translation_texts(
+                        [pending_text, rewrite.units[-1].target_text],
+                        target_lang,
+                    )
+                elif source_segments:
+                    rewrite.units.append(
+                        _InlineSentenceUnit(
+                            source_segments=source_segments,
+                            target_text=pending_text,
+                            sequence=sequence,
+                        )
+                    )
+                    sequence += 1
+                pending_target_only.clear()
+
+            rewrite.units.append(
+                _InlineSentenceUnit(
+                    source_segments=source_segments,
+                    target_text=target_text.strip(),
+                    sequence=sequence,
+                )
+            )
+            last_key = key
+            sequence += 1
+            continue
+
+        if not target_text:
+            continue
+        if last_key is None:
+            pending_target_only.append(target_text)
+            continue
+        rewrite = buckets[last_key]
+        if rewrite.units:
+            rewrite.units[-1].target_text = _join_translation_texts(
+                [rewrite.units[-1].target_text, target_text],
+                target_lang,
+            )
+
+    if pending_target_only and buckets:
+        first_key = min(
+            buckets,
+            key=lambda item: (
+                buckets[item].chapter_idx,
+                buckets[item].paragraph_idx,
+                buckets[item].sequence,
+            ),
+        )
+        rewrite = buckets[first_key]
+        if rewrite.units:
+            rewrite.units[0].target_text = _join_translation_texts(
+                [*pending_target_only, rewrite.units[0].target_text],
+                target_lang,
+            )
+
+    rewrites_by_chapter: dict[int, list[_InlineParagraphRewrite]] = defaultdict(list)
+    for rewrite in buckets.values():
+        if rewrite.units:
+            rewrites_by_chapter[rewrite.chapter_idx].append(rewrite)
+    return rewrites_by_chapter
+
+
 def _inject_translation_block(
     *,
     root,
     book: epub.EpubBook,
     injection: _ParagraphInjection,
-    target_lang: str,
-    emit_translation_metadata: bool,
+    config: SourceLayoutBuilderConfig,
 ) -> bool:
     resolved = resolve_cfi(injection.paragraph_cfi, book, _root=root)
     block = _resolve_block_anchor(resolved)
@@ -354,11 +575,10 @@ def _inject_translation_block(
         root=root,
         source_block=block,
         injection=injection,
-        target_lang=target_lang,
-        emit_translation_metadata=emit_translation_metadata,
+        config=config,
     )
     separator_block = _build_translation_separator(root)
-    if emit_translation_metadata:
+    if config.emit_translation_metadata:
         _remove_existing_translation_blocks(block, injection.paragraph_cfi)
     _insert_after(block, translation_block)
     _insert_after(translation_block, separator_block)
@@ -416,17 +636,20 @@ def _build_translation_block(
     root,
     source_block,
     injection: _ParagraphInjection,
-    target_lang: str,
-    emit_translation_metadata: bool,
+    config: SourceLayoutBuilderConfig,
 ):
     tag = _translation_tag_for_block(source_block)
     block = _make_xhtml_element(root, tag)
-    if emit_translation_metadata:
+    if config.emit_translation_metadata:
         block.set('class', 'bookalign-translation-block')
-        block.set('lang', target_lang)
+        block.set('lang', config.target_lang)
         block.set('data-bookalign-anchor-cfi', injection.paragraph_cfi)
         block.set('data-bookalign-paragraph', str(injection.paragraph_idx))
-    block.text = ''.join(injection.target_texts)
+    block.text = _normalize_target_text_for_layout(
+        ''.join(injection.target_texts),
+        target_lang=config.target_lang,
+        config=config,
+    )
     block.tail = '\n'
 
     return block
@@ -476,6 +699,355 @@ def _is_blank_separator(element) -> bool:
     return _local_tag(element.tag) == 'p' and len(element) == 1 and _local_tag(element[0].tag) == 'br'
 
 
+def _rewrite_inline_paragraph(
+    *,
+    root,
+    book: epub.EpubBook,
+    rewrite: _InlineParagraphRewrite,
+    config: SourceLayoutBuilderConfig,
+    tag_config: TagFilterConfig,
+) -> bool:
+    resolved = resolve_cfi(rewrite.paragraph_cfi, book, _root=root)
+    block = _resolve_block_anchor(resolved)
+    if block is None:
+        return False
+
+    if config.emit_translation_metadata:
+        block.set('data-bookalign-writeback', 'inline')
+        block.set('data-bookalign-anchor-cfi', rewrite.paragraph_cfi)
+        block.set('data-bookalign-paragraph', str(rewrite.paragraph_idx))
+
+    original_block = deepcopy(block)
+    spans = _collect_runtime_text_spans(original_block, tag_config)
+    if not spans:
+        return False
+
+    trimmed_spans, _, _, _, _ = _trim_spans(spans)
+    if not trimmed_spans:
+        return False
+
+    boundaries = _build_span_boundaries(trimmed_spans)
+    path_map = _node_path_map(original_block)
+    _clear_block_content(block)
+    emitted = False
+    for unit_index, unit in enumerate(rewrite.units):
+        sentence_range = _sentence_unit_range(unit, rewrite.paragraph_idx)
+        if sentence_range is None:
+            continue
+        sentence_start, sentence_end = sentence_range
+        slot_texts, preserved_nodes = _sentence_slot_payload(
+            boundaries=boundaries,
+            sentence_start=sentence_start,
+            sentence_end=sentence_end,
+            path_map=path_map,
+        )
+        sentence_fragment = _build_sentence_fragment(
+            original_node=original_block,
+            path_map=path_map,
+            slot_texts=slot_texts,
+            preserved_nodes=preserved_nodes,
+        )
+        if not sentence_fragment:
+            source_text = _join_segment_texts(unit.source_segments)
+            if source_text:
+                _append_piece(block, source_text)
+                emitted = True
+        else:
+            for piece in sentence_fragment:
+                _append_piece(block, piece)
+            emitted = True
+
+        if unit.target_text:
+            _append_break(block, root)
+            _append_piece(
+                block,
+                _normalize_target_text_for_layout(
+                    unit.target_text,
+                    target_lang=config.target_lang,
+                    config=config,
+                ),
+            )
+            emitted = True
+        if unit_index < len(rewrite.units) - 1:
+            _append_break(block, root)
+
+    if not emitted:
+        return False
+
+    _remove_following_blank_separators(block)
+    _insert_after(block, _build_translation_separator(root))
+    return True
+
+
+def _clear_block_content(block) -> None:
+    block.text = None
+    for child in block:
+        child.tail = None
+        block.remove(child)
+
+
+def _node_path_map(root) -> dict[object, tuple[int, ...]]:
+    mapping: dict[object, tuple[int, ...]] = {root: ()}
+
+    def walk(node, path: tuple[int, ...]) -> None:
+        element_children = [child for child in node if isinstance(child.tag, str)]
+        for index, child in enumerate(element_children):
+            child_path = (*path, index)
+            mapping[child] = child_path
+            walk(child, child_path)
+
+    walk(root, ())
+    return mapping
+
+
+def _sentence_unit_range(unit: _InlineSentenceUnit, paragraph_idx: int) -> tuple[int, int] | None:
+    relevant = [
+        segment
+        for segment in unit.source_segments
+        if segment.paragraph_idx == paragraph_idx
+        and segment.text_start is not None
+        and segment.text_end is not None
+    ]
+    if not relevant:
+        return None
+    start = min(segment.text_start for segment in relevant if segment.text_start is not None)
+    end = max(segment.text_end for segment in relevant if segment.text_end is not None)
+    if start is None or end is None or start >= end:
+        return None
+    return start, end
+
+
+def _sentence_slot_payload(
+    *,
+    boundaries,
+    sentence_start: int,
+    sentence_end: int,
+    path_map: dict[object, tuple[int, ...]],
+) -> tuple[dict[_TextSlotKey, str], set[tuple[int, ...]]]:
+    slot_texts: dict[_TextSlotKey, str] = {}
+    preserved_nodes: set[tuple[int, ...]] = {()}
+    for span_start, span_end, span in boundaries:
+        overlap_start = max(sentence_start, span_start)
+        overlap_end = min(sentence_end, span_end)
+        if overlap_start >= overlap_end:
+            continue
+        owner = getattr(span, '_node', None)
+        if owner is None:
+            continue
+        owner_path = path_map.get(owner)
+        if owner_path is None:
+            continue
+        relative_start = overlap_start - span_start
+        relative_end = overlap_end - span_start
+        text = span.text[relative_start:relative_end]
+        key = _TextSlotKey(
+            owner_path=owner_path,
+            source_kind=span.source_kind,
+            text_node_index=span.text_node_index,
+        )
+        slot_texts[key] = slot_texts.get(key, '') + text
+        preserved_nodes.update(_ancestor_paths(owner_path))
+        if span.source_kind == 'synthetic-break':
+            preserved_nodes.add(owner_path)
+    return slot_texts, preserved_nodes
+
+
+def _collect_runtime_text_spans(element, config: TagFilterConfig) -> list[TextSpan]:
+    tree = element.getroottree()
+    raw_spans = list(_iter_readable_text_parts(element, tree, config))
+    if not raw_spans:
+        return []
+
+    kept: list[TextSpan] = []
+    for idx, span in enumerate(raw_spans):
+        text = SentenceSplitter.normalize_text(span.text)
+        if _should_drop_standalone_span(raw_spans, idx, text, config):
+            continue
+        kept.append(span)
+
+    collapsed: list[TextSpan] = []
+    for span in kept:
+        _append_runtime_span(collapsed, span)
+    return collapsed
+
+
+def _append_runtime_span(spans: list[TextSpan], span: TextSpan) -> None:
+    text = _normalize_fragment(span.text)
+    if not text:
+        return
+
+    if spans and spans[-1].text.endswith(' ') and text.startswith(' '):
+        text = text.lstrip()
+    elif spans and _needs_inter_span_space(spans[-1].text, text):
+        text = f' {text}'
+    if not text:
+        return
+
+    runtime_span = TextSpan(
+        text=text,
+        xpath=span.xpath,
+        text_node_index=span.text_node_index,
+        char_offset=span.char_offset,
+        source_kind=span.source_kind,
+        cfi_text_node_index=span.cfi_text_node_index,
+        cfi_exact=span.cfi_exact,
+    )
+    if hasattr(span, '_node'):
+        runtime_span._node = span._node
+    if hasattr(span, '_tag'):
+        runtime_span._tag = span._tag
+    spans.append(runtime_span)
+
+
+def _ancestor_paths(path: tuple[int, ...]) -> list[tuple[int, ...]]:
+    return [path[:idx] for idx in range(len(path) + 1)]
+
+
+def _build_sentence_fragment(
+    *,
+    original_node,
+    path_map: dict[object, tuple[int, ...]],
+    slot_texts: dict[_TextSlotKey, str],
+    preserved_nodes: set[tuple[int, ...]],
+):
+    pieces: list[object] = []
+    text_key = _slot_key(path_map[original_node], 'text', 0)
+    text = slot_texts.get(text_key, '')
+    if text:
+        pieces.append(text)
+
+    element_children = [child for child in original_node if isinstance(child.tag, str)]
+    for child in element_children:
+        child_path = path_map[child]
+        child_piece = _build_element_piece(
+            original_node=child,
+            path_map=path_map,
+            slot_texts=slot_texts,
+            preserved_nodes=preserved_nodes,
+        )
+        if child_piece is not None:
+            pieces.append(child_piece)
+
+        tail_key = _slot_key(child_path[:-1], 'tail', _tail_slot_index(original_node, child))
+        tail_text = slot_texts.get(tail_key, '')
+        if tail_text:
+            pieces.append(tail_text)
+    return pieces
+
+
+def _build_element_piece(
+    *,
+    original_node,
+    path_map: dict[object, tuple[int, ...]],
+    slot_texts: dict[_TextSlotKey, str],
+    preserved_nodes: set[tuple[int, ...]],
+):
+    node_path = path_map[original_node]
+    tag = _local_tag(original_node.tag)
+    if tag == 'br':
+        key = _slot_key(node_path, 'synthetic-break', 0)
+        if key in slot_texts:
+            clone = _clone_shallow(original_node)
+            clone.tail = None
+            return clone
+        return None
+    if tag in {'rt', 'rp'}:
+        clone = deepcopy(original_node)
+        clone.tail = None
+        return clone
+
+    keep_node = node_path in preserved_nodes
+    if not keep_node:
+        return None
+
+    clone = _clone_shallow(original_node)
+    text_key = _slot_key(node_path, 'text', 0)
+    clone.text = slot_texts.get(text_key, '')
+    element_children = [child for child in original_node if isinstance(child.tag, str)]
+    for child in element_children:
+        child_piece = _build_element_piece(
+            original_node=child,
+            path_map=path_map,
+            slot_texts=slot_texts,
+            preserved_nodes=preserved_nodes,
+        )
+        if child_piece is not None:
+            clone.append(child_piece)
+
+        tail_key = _slot_key(node_path, 'tail', _tail_slot_index(original_node, child))
+        tail_text = slot_texts.get(tail_key, '')
+        if tail_text:
+            if len(clone):
+                clone[-1].tail = (clone[-1].tail or '') + tail_text
+            else:
+                clone.text = (clone.text or '') + tail_text
+
+    if clone.text:
+        return clone
+    if len(clone):
+        return clone
+    return None
+
+
+def _clone_shallow(element):
+    clone = etree.Element(element.tag, attrib=dict(element.attrib), nsmap=element.nsmap)
+    return clone
+
+
+def _slot_key(owner_path: tuple[int, ...], source_kind: str, text_node_index: int) -> _TextSlotKey:
+    return _TextSlotKey(owner_path=owner_path, source_kind=source_kind, text_node_index=text_node_index)
+
+
+def _tail_slot_index(parent, child) -> int:
+    count = 0
+    for current in parent:
+        if isinstance(current.tag, str):
+            count += 1
+        if current is child:
+            return count
+    return count
+
+
+def _append_piece(parent, piece) -> None:
+    if isinstance(piece, str):
+        if len(parent):
+            parent[-1].tail = (parent[-1].tail or '') + piece
+        else:
+            parent.text = (parent.text or '') + piece
+        return
+    parent.append(piece)
+    piece.tail = piece.tail or ''
+
+
+def _append_break(parent, root) -> None:
+    _append_piece(parent, _make_xhtml_element(root, 'br'))
+
+
+def _normalize_target_text_for_layout(
+    text: str,
+    *,
+    target_lang: str,
+    config: SourceLayoutBuilderConfig,
+) -> str:
+    if not text:
+        return ''
+    if not config.normalize_vertical_punctuation:
+        return text
+    if config.layout_direction != 'horizontal':
+        return text
+    if target_lang.split('-', 1)[0].casefold() != 'zh':
+        return text
+    return text.translate(_VERTICAL_TO_HORIZONTAL_PUNCTUATION)
+
+
+def _remove_following_blank_separators(block) -> None:
+    sibling = block.getnext()
+    while sibling is not None and _is_blank_separator(sibling):
+        next_sibling = sibling.getnext()
+        sibling.getparent().remove(sibling)
+        sibling = next_sibling
+
+
 def _normalize_layout_root(root, *, layout_direction: str) -> None:
     if layout_direction != 'horizontal':
         return
@@ -511,6 +1083,17 @@ def _parse_raw_document_xml(doc: epub.EpubHtml):
     if isinstance(root.tag, str) and _local_tag(root.tag) == 'html':
         return root
     return parse_item_xml(doc)
+
+
+def _set_document_content(doc: epub.EpubHtml, root) -> None:
+    doc.set_content(
+        etree.tostring(
+            root,
+            encoding='utf-8',
+            xml_declaration=True,
+            pretty_print=True,
+        )
+    )
 
 
 def _preserve_document_head(doc: epub.EpubHtml, root) -> None:

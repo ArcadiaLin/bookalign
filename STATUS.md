@@ -32,14 +32,17 @@ EPUB 读取
 - 已实现章节级 DP 匹配
 - 已支持 `structured` / `raw` 两种章节匹配模式
 - 《金阁寺》上已验证 `structured` 能避开前后附文错配
+- 已支持将 `AlignmentResult` 存储为 JSON，用于后续 builder-only 测试
 
 ### EPUB builder
 
 - `simple` builder 可生成句对式双语 EPUB
 - `source_layout` builder 可基于 source `CFI` 把译文回写到原书结构
+- `source_layout` 已拆成 `writeback_mode=paragraph|inline`
 - source-layout 默认输出中文横排版本
 - 已修复部分阅读器中由原书 `rtl` 方向继承导致的翻页颠倒问题
 - 已修复 source-layout 输出 XHTML 的可读性和调试可读性
+- `inline` 模式已支持在原 block 内按“原句 -> 译句”交错回写，并在段与段之间插入空白分隔段
 
 ### 测试与审阅
 
@@ -66,17 +69,20 @@ EPUB 读取
 优先使用：
 
 - `builder_mode=source_layout`
+- `writeback_mode=inline`
 - `layout_direction=horizontal`
 
 原因：
 
 - 保留 source 章节结构
 - 中文阅读器兼容性更好
+- 可直接观察句位回写效果
 - 当前是更适合人工审阅的实际输出模式
 
 ## 当前边界
 
-- source-layout 仍是段落级回写，不是句内 inline 回写
+- `paragraph` 模式仍是更稳的默认回写路径
+- `inline` 模式当前主要面向日文 source EPUB
 - `raw` 章节匹配主要用于对照测试，不是默认推荐模式
 - 对齐得分目前仍是 adapter 默认分值，不是严格语义置信度
 - builder 的样式保真仍以“可读”和“兼容”优先，不追求完全复制原书视觉
@@ -86,7 +92,7 @@ EPUB 读取
 最近一次全量测试：
 
 ```text
-36 passed
+37 passed in 69.42s
 ```
 
 当前环境已经确认：
@@ -109,6 +115,6 @@ EPUB 读取
 ## 下一步
 
 1. 继续提升 source-layout 在不同阅读器中的兼容性。
-2. 评估是否要引入更细粒度的 inline 级定位信息。
-3. 为对齐质量建立更系统的抽样审阅和回归基线。
+2. 继续扩大 inline 回写在真实书上的样式与阅读器回归覆盖。
+3. 为缓存 alignment JSON 的 builder 回归建立更系统的抽样基线。
 4. 扩展真实书籍覆盖，不只依赖《金阁寺》单一主样本。

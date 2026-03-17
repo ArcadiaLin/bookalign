@@ -249,6 +249,62 @@ def test_extract_segments_sentences_keep_paragraph_anchor_metadata():
     assert all(segment.text_start < segment.text_end for segment in first_paragraph)
 
 
+def test_extract_segments_handles_traditional_chinese_dialogue_closers():
+    book = epub.EpubBook()
+    book.set_identifier('trad-dialogue-test')
+    book.set_title('Trad Dialogue Test')
+    book.set_language('zh')
+    chapter = epub.EpubHtml(title='第一章', file_name='chapter1.xhtml', lang='zh')
+    chapter.set_content('<p>主治醫生來了說，﹁不敢保證救得活。﹂我像針插包似的被注射樟腦液和葡萄糖。</p>')
+    book.add_item(chapter)
+    book.spine = [chapter]
+    book.toc = (chapter,)
+
+    chapter_idx, doc = get_spine_documents(book)[0]
+    segments = extract_segments(
+        book,
+        doc,
+        chapter_idx=chapter_idx,
+        splitter=SentenceSplitter(language='zh'),
+    )
+
+    assert [segment.text for segment in segments] == [
+        '主治醫生來了說，﹁不敢保證救得活。﹂',
+        '我像針插包似的被注射樟腦液和葡萄糖。',
+    ]
+    assert segments[0].text_end == segments[1].text_start
+
+
+def test_extract_segments_does_not_misclassify_dense_anchor_paragraph_as_navigation():
+    book = epub.EpubBook()
+    book.set_identifier('anchor-paragraph-test')
+    book.set_title('Anchor Paragraph Test')
+    book.set_language('zh')
+    chapter = epub.EpubHtml(title='第一章', file_name='chapter1.xhtml', lang='zh')
+    chapter.set_content(
+        '<p>美──美這玩意太可怕了！在這地球上，有太多謎團折磨人類了'
+        '<a id="GBS.0005.02"></a>。若能解開這些謎團，就等於從水中出來卻滴水不沾。'
+        '卻以索多瑪惡行<span class="super tcy p_smaller_note" id="footnote-000-backlink"><a href="#footnote-000">1</a></span>'
+        '的理想告終。那就是有些人心懷惡行的理想，同時卻<a id="GBS.0005.03"></a>也不否定聖母的理想。'
+        '這都是因為用理性的眼光<a id="GBS.0005.04"></a>看似汙辱的，以感性的眼光看來卻是道地的美。'
+        '惡行之中真的有美嗎？⋯⋯</p>'
+    )
+    book.add_item(chapter)
+    book.spine = [chapter]
+    book.toc = (chapter,)
+
+    chapter_idx, doc = get_spine_documents(book)[0]
+    segments = extract_segments(
+        book,
+        doc,
+        chapter_idx=chapter_idx,
+        splitter=SentenceSplitter(language='zh'),
+    )
+
+    assert segments
+    assert any(segment.text.startswith('美──美這玩意太可怕了！') for segment in segments)
+
+
 def _book_path(pattern: str) -> Path:
     matches = sorted(BOOKS_DIR.glob(pattern))
     assert matches, f'No EPUB found for pattern: {pattern}'

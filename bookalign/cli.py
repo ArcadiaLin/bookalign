@@ -25,10 +25,26 @@ def build_parser() -> argparse.ArgumentParser:
         help='EPUB builder mode. "source_layout" writes translations back into the source EPUB structure.',
     )
     parser.add_argument(
+        '--writeback-mode',
+        default='paragraph',
+        choices=('paragraph', 'inline'),
+        help='Source-layout writeback strategy. "inline" rewrites source paragraphs sentence-by-sentence.',
+    )
+    parser.add_argument(
         '--chapter-match-mode',
         default='structured',
         choices=('structured', 'raw'),
         help='Chapter matching strategy. "raw" disables paratext-aware skip bias.',
+    )
+    parser.add_argument(
+        '--alignment-json-input',
+        type=Path,
+        help='Load a previously saved alignment JSON and skip chapter matching / Bertalign.',
+    )
+    parser.add_argument(
+        '--alignment-json-output',
+        type=Path,
+        help='Save the freshly computed alignment result to JSON for later builder-only tests.',
     )
     parser.add_argument(
         '--layout-direction',
@@ -40,6 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
         '--emit-translation-metadata',
         action='store_true',
         help='Emit debug metadata attributes on injected translation paragraphs.',
+    )
+    parser.add_argument(
+        '--disable-vertical-punctuation-normalization',
+        action='store_true',
+        help='Keep vertical-form punctuation in target text even when output layout is horizontal.',
     )
     return parser
 
@@ -54,8 +75,12 @@ def main() -> None:
         target_lang=args.target_lang,
         builder_mode=args.builder_mode,
         chapter_match_mode=args.chapter_match_mode,
+        alignment_json_input_path=args.alignment_json_input,
+        alignment_json_output_path=args.alignment_json_output,
+        writeback_mode=args.writeback_mode,
         layout_direction=args.layout_direction,
         emit_translation_metadata=args.emit_translation_metadata,
+        normalize_vertical_punctuation=not args.disable_vertical_punctuation_normalization,
     )
     print(f'Generated {args.output_epub} with {len(alignment.pairs)} aligned pairs.')
 

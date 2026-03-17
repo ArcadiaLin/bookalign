@@ -316,3 +316,208 @@ def test_build_bilingual_epub_on_source_layout_can_emit_translation_metadata(tmp
     content = get_spine_documents(read_epub(output_path))[0][1].get_content().decode('utf-8')
     assert 'bookalign-translation-block' in content
     assert 'data-bookalign-anchor-cfi' in content
+
+
+def test_build_bilingual_epub_on_source_layout_inline_rewrites_source_block(tmp_path: Path):
+    source_book = _book(
+        'Japanese Source',
+        'ja',
+        '第一章',
+        '<p><ruby>甲<rt>こう</rt></ruby>乙。</p><p><strong>丙。</strong></p>',
+    )
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>译一。译二。</p>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[_segment('译一。', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+            AlignedPair(
+                source=[source_segments[1]],
+                target=[_segment('译二。', paragraph_idx=0, sentence_idx=1)],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+    )
+
+    output_path = tmp_path / 'aligned-source-layout-inline.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        writeback_mode='inline',
+    )
+
+    built = read_epub(output_path)
+    assert built.direction == 'ltr'
+    content = get_spine_documents(built)[0][1].get_content().decode('utf-8')
+    assert 'bookalign-translation-block' not in content
+    assert '<ruby>甲<rt>こう</rt></ruby>乙。' in content
+    assert '<strong>丙。</strong>' in content
+    assert '译一。' in content
+    assert '译二。' in content
+    assert content.count('<p><br/></p>') == 2
+
+    with ZipFile(output_path) as archive:
+        raw = archive.read('EPUB/chapter1.xhtml').decode('utf-8')
+    assert '<br/>' in raw
+    assert '译一。' in raw
+    assert '译二。' in raw
+
+
+def test_inline_writeback_reuses_trimmed_runtime_coordinates(tmp_path: Path):
+    source_book = _book(
+        'Japanese Source',
+        'ja',
+        '第一章',
+        '<p>　甲。乙。</p>',
+    )
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>译一。译二。</p>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[_segment('译一。', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+            AlignedPair(
+                source=[source_segments[1]],
+                target=[_segment('译二。', paragraph_idx=0, sentence_idx=1)],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+    )
+
+    output_path = tmp_path / 'aligned-inline-trimmed.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        writeback_mode='inline',
+    )
+
+    with ZipFile(output_path) as archive:
+        raw = archive.read('EPUB/chapter1.xhtml').decode('utf-8').replace('\n', '')
+    assert '甲。<br/>译一。<br/>乙。<br/>译二。' in raw
+
+
+def test_source_layout_normalizes_vertical_punctuation_for_horizontal_chinese_output(tmp_path: Path):
+    def make_fixture() -> tuple[epub.EpubBook, epub.EpubBook, AlignmentResult]:
+        source_book = _book(
+            'Japanese Source',
+            'ja',
+            '第一章',
+            '<p>甲。</p>',
+        )
+        target_book = _book('Chinese Target', 'zh', '第一章', '<p>︽告白︾﹁真的嗎﹂︿上卷﹀</p>')
+        chapter = get_spine_documents(source_book)[0][1]
+        source_segments = extract_segments(
+            source_book,
+            chapter,
+            chapter_idx=0,
+            splitter=SentenceSplitter(language='ja'),
+        )
+        alignment = AlignmentResult(
+            pairs=[
+                AlignedPair(
+                    source=[source_segments[0]],
+                    target=[_segment('︽告白︾﹁真的嗎﹂︿上卷﹀', paragraph_idx=0, sentence_idx=0)],
+                    score=1.0,
+                ),
+            ],
+            source_lang='ja',
+            target_lang='zh',
+            granularity='sentence',
+        )
+        return source_book, target_book, alignment
+
+    source_book, target_book, alignment = make_fixture()
+    paragraph_output = tmp_path / 'aligned-vertical-punct-paragraph.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        paragraph_output,
+        writeback_mode='paragraph',
+    )
+    paragraph_content = get_spine_documents(read_epub(paragraph_output))[0][1].get_content().decode('utf-8')
+    assert '《告白》「真的嗎」〈上卷〉' in paragraph_content
+
+    source_book, target_book, alignment = make_fixture()
+    inline_output = tmp_path / 'aligned-vertical-punct-inline.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        inline_output,
+        writeback_mode='inline',
+    )
+    inline_content = get_spine_documents(read_epub(inline_output))[0][1].get_content().decode('utf-8')
+    assert '《告白》「真的嗎」〈上卷〉' in inline_content
+
+
+def test_source_layout_can_disable_vertical_punctuation_normalization(tmp_path: Path):
+    source_book = _book(
+        'Japanese Source',
+        'ja',
+        '第一章',
+        '<p>甲。</p>',
+    )
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>︽告白︾</p>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[_segment('︽告白︾', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+    )
+
+    output_path = tmp_path / 'aligned-vertical-punct-disabled.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        normalize_vertical_punctuation=False,
+    )
+
+    content = get_spine_documents(read_epub(output_path))[0][1].get_content().decode('utf-8')
+    assert '︽告白︾' in content

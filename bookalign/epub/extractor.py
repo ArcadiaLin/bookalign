@@ -192,10 +192,10 @@ def _looks_like_navigation_block(element, text: str) -> bool:
     anchors = [child for child in element.iterdescendants() if isinstance(child.tag, str) and _local_tag(child.tag) == 'a']
     if not anchors:
         return False
-    hrefs = [anchor.get('href', '') for anchor in anchors]
-    if len(anchors) >= 3 and ('|' in text or all('#' in href for href in hrefs if href)):
+    hrefs = [href for anchor in anchors if (href := anchor.get('href', '').strip())]
+    if len(hrefs) >= 3 and ('|' in text or all('#' in href for href in hrefs)):
         return True
-    if _local_tag(element.tag) == 'li' and len(anchors) >= 1 and all('#' in href for href in hrefs if href):
+    if _local_tag(element.tag) == 'li' and hrefs and all('#' in href for href in hrefs):
         return True
     return False
 
@@ -317,7 +317,7 @@ def _append_span(spans: list[TextSpan], span: TextSpan) -> None:
 
 
 def _clone_span(span: TextSpan) -> TextSpan:
-    return TextSpan(
+    clone = TextSpan(
         text=span.text,
         xpath=span.xpath,
         text_node_index=span.text_node_index,
@@ -326,6 +326,11 @@ def _clone_span(span: TextSpan) -> TextSpan:
         cfi_text_node_index=span.cfi_text_node_index,
         cfi_exact=span.cfi_exact,
     )
+    if hasattr(span, '_node'):
+        clone._node = span._node
+    if hasattr(span, '_tag'):
+        clone._tag = span._tag
+    return clone
 
 
 def _needs_inter_span_space(previous: str, current: str) -> bool:

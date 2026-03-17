@@ -9,6 +9,7 @@ import re
 
 from ebooklib import epub
 
+from bookalign.alignment_json import load_alignment_result, save_alignment_result
 from bookalign.align.aligner import align_segments
 from bookalign.align.base import BaseAligner
 from bookalign.align.bertalign_adapter import BertalignAdapter
@@ -425,26 +426,64 @@ def run_bilingual_epub_pipeline(
     target_lang: str = 'zh',
     builder_mode: str = 'simple',
     chapter_match_mode: str = 'structured',
+    alignment_json_input_path: str | Path | None = None,
+    alignment_json_output_path: str | Path | None = None,
+    writeback_mode: str = 'paragraph',
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
+    normalize_vertical_punctuation: bool = True,
     aligner: BaseAligner | None = None,
 ) -> AlignmentResult:
     """Run the end-to-end pipeline and write a bilingual EPUB."""
 
     if layout_direction not in {'horizontal', 'source'}:
         raise ValueError(f'Unsupported layout_direction: {layout_direction}')
+    if writeback_mode not in {'paragraph', 'inline'}:
+        raise ValueError(f'Unsupported writeback_mode: {writeback_mode}')
 
     source_book = read_epub(source_epub_path)
     target_book = read_epub(target_epub_path)
 
-    alignment = align_books(
-        source_book,
-        target_book,
-        source_lang=source_lang,
-        target_lang=target_lang,
-        chapter_match_mode=chapter_match_mode,
-        aligner=aligner,
+    if alignment_json_input_path is not None:
+        alignment = load_alignment_result(alignment_json_input_path)
+    else:
+        alignment = align_books(
+            source_book,
+            target_book,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            chapter_match_mode=chapter_match_mode,
+            aligner=aligner,
+        )
+        if alignment_json_output_path is not None:
+            save_alignment_result(alignment, alignment_json_output_path)
+
+    build_bilingual_epub_from_alignment(
+        alignment=alignment,
+        source_book=source_book,
+        target_book=target_book,
+        output_path=output_path,
+        builder_mode=builder_mode,
+        writeback_mode=writeback_mode,
+        layout_direction=layout_direction,
+        emit_translation_metadata=emit_translation_metadata,
+        normalize_vertical_punctuation=normalize_vertical_punctuation,
     )
+    return alignment
+
+
+def build_bilingual_epub_from_alignment(
+    *,
+    alignment: AlignmentResult,
+    source_book: epub.EpubBook,
+    target_book: epub.EpubBook,
+    output_path: str | Path,
+    builder_mode: str = 'simple',
+    writeback_mode: str = 'paragraph',
+    layout_direction: str = 'horizontal',
+    emit_translation_metadata: bool = False,
+    normalize_vertical_punctuation: bool = True,
+) -> None:
     if builder_mode == 'simple':
         build_bilingual_epub(
             alignment=alignment,
@@ -452,15 +491,46 @@ def run_bilingual_epub_pipeline(
             target_book=target_book,
             output_path=Path(output_path),
         )
-    elif builder_mode == 'source_layout':
+        return
+    if builder_mode == 'source_layout':
         build_bilingual_epub_on_source_layout(
             alignment=alignment,
             source_book=source_book,
             target_book=target_book,
             output_path=Path(output_path),
+            writeback_mode=writeback_mode,
             layout_direction=layout_direction,
             emit_translation_metadata=emit_translation_metadata,
+            normalize_vertical_punctuation=normalize_vertical_punctuation,
         )
-    else:
-        raise ValueError(f'Unsupported builder_mode: {builder_mode}')
+        return
+    raise ValueError(f'Unsupported builder_mode: {builder_mode}')
+
+
+def build_bilingual_epub_from_alignment_json(
+    *,
+    source_epub_path: str | Path,
+    target_epub_path: str | Path,
+    alignment_json_path: str | Path,
+    output_path: str | Path,
+    builder_mode: str = 'simple',
+    writeback_mode: str = 'paragraph',
+    layout_direction: str = 'horizontal',
+    emit_translation_metadata: bool = False,
+    normalize_vertical_punctuation: bool = True,
+) -> AlignmentResult:
+    source_book = read_epub(source_epub_path)
+    target_book = read_epub(target_epub_path)
+    alignment = load_alignment_result(alignment_json_path)
+    build_bilingual_epub_from_alignment(
+        alignment=alignment,
+        source_book=source_book,
+        target_book=target_book,
+        output_path=output_path,
+        builder_mode=builder_mode,
+        writeback_mode=writeback_mode,
+        layout_direction=layout_direction,
+        emit_translation_metadata=emit_translation_metadata,
+        normalize_vertical_punctuation=normalize_vertical_punctuation,
+    )
     return alignment

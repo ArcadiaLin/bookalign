@@ -352,7 +352,8 @@ extract_sentence_chapters(book, *, language: str) -> list[ExtractedChapter]
 match_extracted_chapters(source_chapters, target_chapters, *, chapter_match_mode: str = 'structured') -> list[ChapterMatch]
 align_extracted_chapters(source_chapters, target_chapters, *, source_lang: str, target_lang: str, chapter_match_mode: str = 'structured', aligner: BaseAligner | None = None) -> AlignmentResult
 align_books(source_book, target_book, *, source_lang: str, target_lang: str, chapter_match_mode: str = 'structured', aligner: BaseAligner | None = None) -> AlignmentResult
-run_bilingual_epub_pipeline(*, source_epub_path, target_epub_path, output_path, source_lang='ja', target_lang='zh', builder_mode='simple', chapter_match_mode='structured', layout_direction='horizontal', emit_translation_metadata=False, aligner=None) -> AlignmentResult
+run_bilingual_epub_pipeline(*, source_epub_path, target_epub_path, output_path, source_lang='ja', target_lang='zh', builder_mode='simple', chapter_match_mode='structured', alignment_json_input_path=None, alignment_json_output_path=None, writeback_mode='paragraph', layout_direction='horizontal', emit_translation_metadata=False, aligner=None) -> AlignmentResult
+build_bilingual_epub_from_alignment_json(*, source_epub_path, target_epub_path, alignment_json_path, output_path, builder_mode='simple', writeback_mode='paragraph', layout_direction='horizontal', emit_translation_metadata=False) -> AlignmentResult
 ```
 
 #### 章节匹配原理
@@ -380,12 +381,28 @@ run_bilingual_epub_pipeline(*, source_epub_path, target_epub_path, output_path, 
 - 保留原始顺序与长度约束
 - 适合做对照实验，观察“不过滤直接对齐”的结果
 
+### 3.9.1 `bookalign/alignment_json.py`
+
+职责：
+
+- 把 `AlignmentResult` 保存为稳定 JSON
+- 从 JSON 恢复 `AlignmentResult`
+- 为 builder-only 测试提供缓存入口
+
+公开接口：
+
+```python
+save_alignment_result(alignment: AlignmentResult, path: str | Path) -> Path
+load_alignment_result(path: str | Path) -> AlignmentResult
+```
+
 ### 3.10 `bookalign/epub/builder.py`
 
 职责：
 
 - 根据 `AlignmentResult` 输出 EPUB
 - 提供 `simple` 与 `source_layout` 两种构建策略
+- 支持从实时对齐结果或缓存 JSON 结果驱动构建
 
 公开接口：
 
@@ -403,6 +420,7 @@ build_bilingual_epub_on_source_layout(
     target_book: epub.EpubBook,
     output_path: Path,
     *,
+    writeback_mode: str = 'paragraph',
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
 ) -> None
@@ -427,10 +445,11 @@ build_bilingual_epub_on_source_layout(
 
 ```text
 遍历 alignment pairs
--> 按 source (chapter_idx, paragraph_idx, paragraph_cfi) 聚合同段译文
+-> 选择 source_layout writeback strategy
 -> 找到 source XHTML 对应段落
--> 在该段后注入 plain <p> 译文段
--> 插入一个空白分隔段
+-> paragraph: 在该段后注入 plain <p> 译文段
+-> inline: 重写原 block 内部为 原句 -> 译句 -> 原句 -> 译句
+-> 在段与段之间插入空白分隔段
 -> 保留原书 head/title/stylesheet
 -> 追加 bookalign 覆盖 CSS
 -> 写出新的 EPUB
@@ -439,9 +458,25 @@ build_bilingual_epub_on_source_layout(
 关键实现点：
 
 - 使用 `paragraph_cfi` 锚定段落，而不是用最后一句 `cfi`
+- `writeback_mode=inline` 依赖 sentence `text_start` / `text_end` 在段内切出句子范围
+- inline builder 会在 builder 侧重新收集 live DOM 文本轨迹，而不是复用已脱离 DOM 的 `Segment.spans`
 - 默认不输出 `class/lang/data-bookalign-*` 调试属性
 - `emit_translation_metadata=True` 时才输出调试元数据
 - 输出 XHTML 使用 `pretty_print=True`，便于直接审查
+
+#### `writeback_mode=paragraph`
+
+- 按 source paragraph 聚合同段译文
+- 在命中的 source block 后插入译文 `<p>`
+- 适合作为更稳的保底路径
+
+#### `writeback_mode=inline`
+
+- 保留原始 block 元素和属性
+- 在同一 block 内写入 source sentence DOM 片段
+- 每个 source sentence 后插入 `<br/>` 与 target sentence 文本
+- 不在段内插空白段；段间插入 `<p><br/></p>`
+- 对 `ruby/strong/em/span` 等常见 inline 结构尽量保留
 
 #### 为什么要保留原始 `<head>`
 
@@ -502,6 +537,7 @@ uv run bookalign SOURCE.epub TARGET.epub OUTPUT.epub \
   --source-lang ja \
   --target-lang zh \
   --builder-mode source_layout \
+  --writeback-mode inline \
   --chapter-match-mode structured \
   --layout-direction horizontal
 ```
@@ -531,6 +567,7 @@ alignment = run_bilingual_epub_pipeline(
     source_lang="ja",
     target_lang="zh",
     builder_mode="source_layout",
+    writeback_mode="inline",
     chapter_match_mode="structured",
     layout_direction="horizontal",
 )

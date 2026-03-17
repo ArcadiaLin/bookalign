@@ -33,16 +33,19 @@ source EPUB + target EPUB
 - `BertalignAdapter` 封装 vendored `bertalign`
 - 章节级 DP 匹配，避免原书/译本 frontmatter 直接错配
 - 支持 `structured` 和 `raw` 两种章节匹配模式
+- 支持把 `AlignmentResult` 保存为 JSON，供后续 builder-only 回归复用
 
 ### 3. EPUB 构建
 
 - `simple` 模式：生成新的双语对照书
-- `source_layout` 模式：保留 source XHTML 结构，在原段落后写回译文
+- `source_layout --writeback-mode paragraph`：保留 source XHTML 结构，在原段落后写回译文
+- `source_layout --writeback-mode inline`：保留 source block 容器，在段内按“原句 -> 译句”交错回写
 - `source_layout + horizontal` 模式下，会把输出书的阅读方向改为 `ltr`，避免部分阅读器沿用原日文 `rtl` 翻页语义
 
 ## 当前边界
 
-- 还没有做句内 inline 级别的精确回写，当前仍是“按 source 段落后插入译文段落”
+- `inline` 模式当前优先覆盖日文 source 书籍
+- 对极复杂 inline 结构仍以“合法 XHTML + 可读 + 尽量保留 inline”为优先，不保证完全视觉等价
 - 章节匹配仍以结构和启发式为主，不是跨章语义全局优化
 - 对复杂诗排、图文页、极差 EPUB 的兼容还不完整
 
@@ -113,6 +116,7 @@ uv run bookalign \
   --source-lang ja \
   --target-lang zh \
   --builder-mode source_layout \
+  --writeback-mode inline \
   --chapter-match-mode structured \
   --layout-direction horizontal
 ```
@@ -137,6 +141,7 @@ uv run bookalign \
 - Bertalign 实际产出句对
 - `simple` 和 `source_layout` 两种 builder 均可生成 EPUB
 - `source_layout` 横排输出已修复阅读方向和分页兼容性问题
+- `source_layout` 已支持 `paragraph` / `inline` 两种回写策略
 
 最新测试状态见 `STATUS.md`。
 
@@ -146,6 +151,7 @@ uv run bookalign \
 - `DESIGN.md`: 架构与设计决策
 - `STATUS.md`: 当前进度、验证状态、下一步
 - `TECHNICAL.md`: 详细技术说明，包含接口、数据结构、流程和原理
+- `TESTING.md`: 测试调用方式、参数和 JSON 复用流程
 
 ## 提交与产物策略
 

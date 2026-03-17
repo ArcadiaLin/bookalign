@@ -5,9 +5,11 @@ from pathlib import Path
 from ebooklib import epub
 import pytest
 
+from bookalign.alignment_json import load_alignment_result
 from bookalign.epub.reader import get_spine_documents, read_epub
 from bookalign.pipeline import (
     align_books,
+    build_bilingual_epub_from_alignment_json,
     extract_sentence_chapters,
     match_extracted_chapters,
     run_bilingual_epub_pipeline,
@@ -33,6 +35,8 @@ def _book(title: str, language: str, chapters: list[tuple[str, str]]) -> epub.Ep
 
     book.spine = docs
     book.toc = tuple(docs)
+    book.add_item(epub.EpubNcx())
+    book.add_item(epub.EpubNav())
     return book
 
 
@@ -186,6 +190,106 @@ def test_align_books_uses_chapter_matching_before_sentence_alignment():
     assert aligner.calls[0] == (['甲。', '乙。'], ['あ。', 'い。'])
     assert aligner.calls[1] == (['丙。'], ['う。'])
     assert len(result.pairs) == 3
+
+
+def test_run_bilingual_epub_pipeline_can_save_alignment_json(tmp_path: Path):
+    source_book = _book('Source', 'ja', [('第一章', '<p>甲。</p><p>乙。</p>')])
+    target_book = _book('Target', 'zh', [('第一章', '<p>译甲。</p><p>译乙。</p>')])
+    source_path = tmp_path / 'source.epub'
+    target_path = tmp_path / 'target.epub'
+    output_path = tmp_path / 'out.epub'
+    json_path = tmp_path / 'alignment.json'
+    epub.write_epub(str(source_path), source_book)
+    epub.write_epub(str(target_path), target_book)
+    aligner = StubAligner()
+
+    result = run_bilingual_epub_pipeline(
+        source_epub_path=source_path,
+        target_epub_path=target_path,
+        output_path=output_path,
+        source_lang='ja',
+        target_lang='zh',
+        alignment_json_output_path=json_path,
+        aligner=aligner,
+    )
+
+    assert output_path.exists()
+    assert json_path.exists()
+    assert len(aligner.calls) == 1
+    restored = load_alignment_result(json_path)
+    assert restored == result
+
+
+def test_run_bilingual_epub_pipeline_can_build_from_alignment_json_without_aligner(tmp_path: Path):
+    source_book = _book('Source', 'ja', [('第一章', '<p>甲。</p><p>乙。</p>')])
+    target_book = _book('Target', 'zh', [('第一章', '<p>译甲。</p><p>译乙。</p>')])
+    source_path = tmp_path / 'source.epub'
+    target_path = tmp_path / 'target.epub'
+    json_path = tmp_path / 'alignment.json'
+    output_path = tmp_path / 'from-json.epub'
+    epub.write_epub(str(source_path), source_book)
+    epub.write_epub(str(target_path), target_book)
+
+    seed_aligner = StubAligner()
+    seeded = run_bilingual_epub_pipeline(
+        source_epub_path=source_path,
+        target_epub_path=target_path,
+        output_path=tmp_path / 'seed.epub',
+        source_lang='ja',
+        target_lang='zh',
+        alignment_json_output_path=json_path,
+        aligner=seed_aligner,
+    )
+    assert seeded.pairs
+
+    unused_aligner = StubAligner()
+    restored = run_bilingual_epub_pipeline(
+        source_epub_path=source_path,
+        target_epub_path=target_path,
+        output_path=output_path,
+        source_lang='ja',
+        target_lang='zh',
+        alignment_json_input_path=json_path,
+        aligner=unused_aligner,
+    )
+
+    assert output_path.exists()
+    assert restored == seeded
+    assert unused_aligner.calls == []
+
+
+def test_build_bilingual_epub_from_alignment_json_reuses_saved_alignment(tmp_path: Path):
+    source_book = _book('Source', 'ja', [('第一章', '<p>甲。</p>')])
+    target_book = _book('Target', 'zh', [('第一章', '<p>译甲。</p>')])
+    source_path = tmp_path / 'source.epub'
+    target_path = tmp_path / 'target.epub'
+    json_path = tmp_path / 'alignment.json'
+    output_path = tmp_path / 'rebuilt.epub'
+    epub.write_epub(str(source_path), source_book)
+    epub.write_epub(str(target_path), target_book)
+
+    run_bilingual_epub_pipeline(
+        source_epub_path=source_path,
+        target_epub_path=target_path,
+        output_path=tmp_path / 'seed.epub',
+        source_lang='ja',
+        target_lang='zh',
+        alignment_json_output_path=json_path,
+        aligner=StubAligner(),
+    )
+
+    result = build_bilingual_epub_from_alignment_json(
+        source_epub_path=source_path,
+        target_epub_path=target_path,
+        alignment_json_path=json_path,
+        output_path=output_path,
+        builder_mode='source_layout',
+        writeback_mode='paragraph',
+        layout_direction='horizontal',
+    )
+
+    assert result.pairs
+    assert output_path.exists()
 
 
 @pytest.mark.integration
