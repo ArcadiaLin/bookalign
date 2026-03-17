@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Core code lives in `bookalign/`. Use `bookalign/epub/` for EPUB reading, extraction, CFI handling, and rebuilding; `bookalign/align/` for alignment backends and adapters; `bookalign/models/` for shared data types; and `bookalign/cli.py` plus `bookalign/pipeline.py` for entry points and orchestration. Tests live in `tests/`, with generated review material under `tests/artifacts/`. Sample EPUB fixtures are kept in `books/`. Design notes and implementation status are documented in `README.md`, `DESIGN.md`, `STATUS.md`, and the extraction-focused markdown files in the repo root.
+Core code lives in `bookalign/`. Use `bookalign/epub/` for EPUB reading, extraction, CFI handling, rebuilding, and debug reporting; `bookalign/align/` for alignment backends and adapters; `bookalign/models/` for shared data types; and `bookalign/cli.py` plus `bookalign/pipeline.py` for entry points and orchestration. Tests live in `tests/`. Committed manual review material is limited to `tests/artifacts/batch_reader_reports/`; other generated artifacts should stay uncommitted. Sample EPUB fixtures are kept in `books/`. Project documentation is maintained in `README.md`, `DESIGN.md`, `STATUS.md`, and `TECHNICAL.md`.
 
 ## Build, Test, and Development Commands
 

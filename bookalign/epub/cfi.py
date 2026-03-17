@@ -464,7 +464,9 @@ def _merge_paths(
 
 
 def resolve_cfi(
-    cfi_str: str, book: epub.EpubBook
+    cfi_str: str,
+    book: epub.EpubBook,
+    _root=None,
 ) -> Optional[dict[str, Any]]:
     """Resolve a CFI string (simple or range) to targets.
 
@@ -490,7 +492,7 @@ def resolve_cfi(
     epub_item = resolve_spine_item(start_path, book)
     if epub_item is None:
         return None
-    root = parse_item_xml(epub_item)
+    root = _root if _root is not None else parse_item_xml(epub_item)
 
     start_target = resolve_path(start_path, book, _root=root)
     end_target = resolve_path(end_path, book, _root=root)

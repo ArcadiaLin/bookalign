@@ -1,164 +1,114 @@
 # BookAlign 当前状态
 
-## 总体判断
+## 总体状态
 
-项目现在已经从“抽取主线已成形”推进到“句子级对齐与新 EPUB 生成链路可实际运行”的阶段。
+项目已从“抽取能力开发中”进入“端到端主链路可运行”阶段。
 
-当前已经具备一条真实可跑的端到端链路：
-
-1. 读取原版 EPUB 与译版 EPUB
-2. 抽取句子级 `Segment`
-3. 基于 `bertalign` 做句子级双语对齐
-4. 生成新的双语 EPUB
-
-这条链路已经在 `books/` 中的《金阁寺》日文原版与中文译本上实际跑通，并产出了可读取的双语 EPUB。
-
-但项目还没有进入“结构保真回写原书 XHTML”的阶段。目前的 builder 仍然是生成一部新的双语阅读 EPUB，而不是把译文精确插回源书原始 DOM。
-
-## 当前已经稳定下来的部分
-
-### 1. EPUB 抽取与定位
-
-文件：
-
-- `bookalign/epub/reader.py`
-- `bookalign/epub/extractor.py`
-- `bookalign/epub/tag_filters.py`
-- `bookalign/epub/sentence_splitter.py`
-- `bookalign/epub/cfi.py`
-
-能力：
-
-1. 读取 EPUB 并按 spine 顺序获取 XHTML 文档
-2. 用规则 + 策略模型抽取段落和句子级 `Segment`
-3. 用 `CFI` 作为主定位方式保存文本范围
-4. 支持 `ja/zh/en/es` 的句子切分
-5. 支持 `extract_text_from_cfi()` 回提验证
-
-当前结论：
-
-1. extractor 已经是稳定边界
-2. 句子级对齐模块直接消费 `Segment`，不需要重新扫描 EPUB DOM
-3. 当前对齐与重建工作没有反向干扰现有 EPUB 操作核心
-
-### 2. 句子级对齐链路
-
-文件：
-
-- `bookalign/align/base.py`
-- `bookalign/align/aligner.py`
-- `bookalign/align/bertalign_adapter.py`
-- `bookalign/pipeline.py`
-
-能力：
-
-1. 统一的 `BaseAligner` 抽象
-2. `BertalignAdapter` 对 vendored `bertalign` 的项目封装
-3. chapter-by-chapter 的句子级对齐编排
-4. 对 frontmatter / backmatter 可跳过的章节匹配
-
-本轮新增的关键能力：
-
-1. 不再按 `zip(source_chapters, target_chapters)` 粗暴匹配章节
-2. 增加了结构驱动的章节匹配层，优先对齐正文，允许跳过封面、目录、版权、注解、年谱、后记等 paratext
-3. 默认 CLI / pipeline 语言方向已经改为更贴近当前主测试集的 `ja -> zh`
-
-### 3. 双语 EPUB 生成
-
-文件：
-
-- `bookalign/epub/builder.py`
-- `bookalign/cli.py`
-
-能力：
-
-1. 根据 `AlignmentResult` 生成新的双语 EPUB
-2. 按章节与段落顺序输出双语句对
-3. 保留 source-only / target-only 的缺失占位
-4. 为缺失标题或仅有生成器文件名的章节提供稳定的 fallback 标题
-
-当前产物形态：
-
-1. 每个章节输出为新的 XHTML 页面
-2. 每个段落内按句对显示原文与译文
-3. 不修改输入 EPUB 本身
-
-## 当前验证结果
-
-### 1. 自动化测试
-
-最近一次全量测试结果：
+当前可运行链路：
 
 ```text
-31 passed in 67.88s
+EPUB 读取
+-> 句子级 Segment 抽取
+-> 章节匹配
+-> Bertalign 句子对齐
+-> 双语 EPUB 输出
 ```
 
-这次覆盖包括：
+这条链路已经在《金阁寺》日文原版与中文译本上实际跑通。
 
-1. 抽取与分句
-2. 对齐适配层
-3. builder 输出
-4. pipeline 编排
-5. 《金阁寺》真实 EPUB 集成测试
+## 已完成
 
-另外，`pytest.ini` 已限制默认收集到 `tests/`，避免把 `scripts/` 中的运行时脚本误当测试收集。
+### 抽取与定位
 
-### 2. Bertalign 运行时验证
+- `reader.py` 已稳定按 spine 读取 XHTML
+- `extractor.py` 已稳定输出 paragraph/sentence `Segment`
+- `sentence_splitter.py` 已覆盖 `ja/zh/en/es`
+- `cfi.py` 已支持句段级 range CFI 生成与回提
+- `Segment` 已补齐 `paragraph_cfi`、`text_start`、`text_end`
 
-当前环境已经验证：
+### 对齐
 
-1. `faiss-cpu`
-2. `torch`
-3. `sentence-transformers`
-4. `googletrans`
-5. `sentence-splitter`
+- 已接入 `BertalignAdapter`
+- 已实现章节级 DP 匹配
+- 已支持 `structured` / `raw` 两种章节匹配模式
+- 《金阁寺》上已验证 `structured` 能避开前后附文错配
 
-本地模型验证：
+### EPUB builder
 
-1. 已确认 `/root/model/LaBSE` 可被 `SentenceTransformer` 正常加载
-2. 已确认模型在当前环境可运行于 `cuda:0`
+- `simple` builder 可生成句对式双语 EPUB
+- `source_layout` builder 可基于 source `CFI` 把译文回写到原书结构
+- source-layout 默认输出中文横排版本
+- 已修复部分阅读器中由原书 `rtl` 方向继承导致的翻页颠倒问题
+- 已修复 source-layout 输出 XHTML 的可读性和调试可读性
 
-### 3. 《金阁寺》真实运行结果
+### 测试与审阅
 
-输入：
+- `pytest` 主测试集已覆盖 extractor / splitter / aligner / pipeline / builder
+- `debug_report.py` 可生成 Markdown 审阅报告
+- 提交中保留 `tests/artifacts/batch_reader_reports/` 作为人工审阅样本
 
-1. `books/金閣寺 (三島由紀夫) (Z-Library).epub`
-2. `books/金阁寺 (三岛由纪夫) (Z-Library).epub`
+## 当前默认工作流
 
-运行结果：
+### 调试句对
 
-1. 成功匹配 10 个正文章节
-2. 成功生成 3901 个对齐 pair
-3. 成功输出一版真实双语 EPUB
+优先使用：
 
-输出文件：
+- `builder_mode=simple`
 
-1. `tests/artifacts/kinkaku_ja_zh_bertalign.epub`
+原因：
 
-当前结论：
+- 句对结构清晰
+- 便于快速发现对齐错误
+- 不受原书版式和阅读器差异影响
 
-1. 章节匹配层已经足以处理这组真实书籍中前后附文不对称的问题
-2. 句子级对齐与新 EPUB 生成链路已经不再停留在 stub 或 demo 阶段
+### 调试原书回写
+
+优先使用：
+
+- `builder_mode=source_layout`
+- `layout_direction=horizontal`
+
+原因：
+
+- 保留 source 章节结构
+- 中文阅读器兼容性更好
+- 当前是更适合人工审阅的实际输出模式
 
 ## 当前边界
 
-项目目前仍然明确保留以下边界：
+- source-layout 仍是段落级回写，不是句内 inline 回写
+- `raw` 章节匹配主要用于对照测试，不是默认推荐模式
+- 对齐得分目前仍是 adapter 默认分值，不是严格语义置信度
+- builder 的样式保真仍以“可读”和“兼容”优先，不追求完全复制原书视觉
 
-1. builder 生成的是新的双语 EPUB，不是结构保真地回写原书 XHTML
-2. `AlignmentResult.score` 目前仍然是 adapter 默认值，不是真实置信度
-3. 章节匹配仍然主要依赖结构、标题与句数启发式，而不是更强的跨章语义匹配
-4. paratext / backmatter 过滤在更多 EPUB 风格上仍需继续收敛
-5. 复杂对白、诗行、强排版依赖内容仍不是当前优化重点
+## 已验证状态
 
-## 下一阶段方向
+最近一次全量测试：
 
-下一阶段最合理的工作顺序是：
+```text
+36 passed
+```
 
-1. 继续收敛章节匹配与 paratext 过滤，扩大真实书籍覆盖面
-2. 为对齐结果增加更可用的质量检查与人工审阅产物
-3. 研究“基于 source CFI/segment 的结构保真回写”方案，而不是只生成简化的新书
-4. 视需要补充段级对齐模式、对齐置信度和后处理修正层
+当前环境已经确认：
 
-一句话总结：
+- `uv` 开发环境可用
+- `align` 依赖组可用
+- `/root/model/LaBSE` 可作为本地模型路径
+- bertalign 运行时可加载本地模型
 
-BookAlign 现在已经不是只有抽取能力的半成品，而是已经具备“extractor -> bertalign -> bilingual EPUB”可运行主链路的工程版本；下一步重点是把这条链路从“可跑”继续推进到“更稳、更准、更保真”。
+## 当前仓库整理状态
+
+为了后续提交，当前已完成一次仓库清理：
+
+- 删除了根目录下过时 extraction 文档
+- 新增统一技术说明文档 `TECHNICAL.md`
+- 清理了 `tests/artifacts/` 中大部分生成物
+- 仅保留 `tests/artifacts/batch_reader_reports/`
+- 收紧了 `.gitignore`，避免新生成物再次进入提交
+
+## 下一步
+
+1. 继续提升 source-layout 在不同阅读器中的兼容性。
+2. 评估是否要引入更细粒度的 inline 级定位信息。
+3. 为对齐质量建立更系统的抽样审阅和回归基线。
+4. 扩展真实书籍覆盖，不只依赖《金阁寺》单一主样本。

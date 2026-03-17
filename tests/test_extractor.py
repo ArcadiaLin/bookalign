@@ -11,6 +11,7 @@ pytest.importorskip('ebooklib')
 pytest.importorskip('lxml')
 pytest.importorskip('pysbd')
 
+from ebooklib import epub
 from lxml import etree
 
 from bookalign.epub.cfi import parse_item_xml, resolve_cfi
@@ -219,6 +220,35 @@ def test_collect_text_spans_inserts_space_between_latin_inline_fragments():
     assert ''.join(span.text for span in spans).strip() == 'works. Despite these efforts'
 
 
+def test_extract_segments_sentences_keep_paragraph_anchor_metadata():
+    book = epub.EpubBook()
+    book.set_identifier('anchor-test')
+    book.set_title('Anchor Test')
+    book.set_language('ja')
+    chapter = epub.EpubHtml(title='第一章', file_name='chapter1.xhtml', lang='ja')
+    chapter.set_content('<p><strong>甲。</strong>乙。</p>')
+    book.add_item(chapter)
+    book.spine = [chapter]
+    book.toc = (chapter,)
+
+    chapter_idx, doc = get_spine_documents(book)[0]
+    segments = extract_segments(
+        book,
+        doc,
+        chapter_idx=chapter_idx,
+        splitter=SentenceSplitter(language='ja'),
+    )
+
+    first_paragraph = [segment for segment in segments if segment.paragraph_idx == 0]
+
+    assert len(first_paragraph) >= 1
+    assert all(segment.paragraph_cfi for segment in first_paragraph)
+    assert len({segment.paragraph_cfi for segment in first_paragraph}) == 1
+    assert all(segment.cfi.startswith('epubcfi(') for segment in first_paragraph)
+    assert all(segment.text_start is not None and segment.text_end is not None for segment in first_paragraph)
+    assert all(segment.text_start < segment.text_end for segment in first_paragraph)
+
+
 def _book_path(pattern: str) -> Path:
     matches = sorted(BOOKS_DIR.glob(pattern))
     assert matches, f'No EPUB found for pattern: {pattern}'
@@ -320,6 +350,9 @@ def test_extract_segments_audits_complex_multilingual_epubs():
             sentence_segments = sentence_cache[doc_name].get(paragraph_segment.paragraph_idx, [])
 
             assert paragraph_segment.cfi.startswith('epubcfi('), f'Missing CFI for {doc_name}'
+            assert paragraph_segment.paragraph_cfi == paragraph_segment.cfi
+            assert paragraph_segment.text_start == 0
+            assert paragraph_segment.text_end == len(paragraph_segment.text)
             assert paragraph_segment.spans, f'Missing spans for {doc_name}'
             assert ''.join(span.text for span in paragraph_segment.spans) == paragraph_segment.text
 
@@ -347,6 +380,8 @@ def test_extract_segments_audits_complex_multilingual_epubs():
                 expected_reconstructed = expected_reconstructed.replace(' ', '')
             assert reconstructed == expected_reconstructed
             assert all(segment.cfi.startswith('epubcfi(') for segment in sentence_segments)
+            assert all(segment.paragraph_cfi == paragraph_segment.cfi for segment in sentence_segments)
+            assert all(segment.text_start is not None and segment.text_end is not None for segment in sentence_segments)
 
             audit_rows.append(
                 {

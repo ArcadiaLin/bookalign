@@ -12,7 +12,10 @@ from ebooklib import epub
 from bookalign.align.aligner import align_segments
 from bookalign.align.base import BaseAligner
 from bookalign.align.bertalign_adapter import BertalignAdapter
-from bookalign.epub.builder import build_bilingual_epub
+from bookalign.epub.builder import (
+    build_bilingual_epub,
+    build_bilingual_epub_on_source_layout,
+)
 from bookalign.epub.extractor import extract_segments
 from bookalign.epub.reader import get_spine_documents, read_epub
 from bookalign.epub.sentence_splitter import SentenceSplitter
@@ -104,8 +107,13 @@ def extract_sentence_chapters(
 def match_extracted_chapters(
     source_chapters: list[ExtractedChapter],
     target_chapters: list[ExtractedChapter],
+    *,
+    chapter_match_mode: str = 'structured',
 ) -> list[ChapterMatch]:
     """Match chapter sequences while allowing front/back matter skips."""
+
+    if chapter_match_mode not in {'structured', 'raw'}:
+        raise ValueError(f'Unsupported chapter_match_mode: {chapter_match_mode}')
 
     src_len = len(source_chapters)
     tgt_len = len(target_chapters)
@@ -122,13 +130,19 @@ def match_extracted_chapters(
                 continue
 
             if i < src_len:
-                skip_source = current + _chapter_skip_penalty(source_chapters[i])
+                skip_source = current + _chapter_skip_penalty(
+                    source_chapters[i],
+                    chapter_match_mode=chapter_match_mode,
+                )
                 if skip_source < scores[i + 1][j]:
                     scores[i + 1][j] = skip_source
                     back[i + 1][j] = ('skip_source', i, j)
 
             if j < tgt_len:
-                skip_target = current + _chapter_skip_penalty(target_chapters[j])
+                skip_target = current + _chapter_skip_penalty(
+                    target_chapters[j],
+                    chapter_match_mode=chapter_match_mode,
+                )
                 if skip_target < scores[i][j + 1]:
                     scores[i][j + 1] = skip_target
                     back[i][j + 1] = ('skip_target', i, j)
@@ -141,6 +155,7 @@ def match_extracted_chapters(
                     tgt_idx=j,
                     src_total=src_len,
                     tgt_total=tgt_len,
+                    chapter_match_mode=chapter_match_mode,
                 )
                 if pair_cost < scores[i + 1][j + 1]:
                     scores[i + 1][j + 1] = pair_cost
@@ -169,6 +184,7 @@ def match_extracted_chapters(
                         tgt_idx=prev_j,
                         src_total=src_len,
                         tgt_total=tgt_len,
+                        chapter_match_mode=chapter_match_mode,
                     ),
                 )
             )
@@ -180,7 +196,11 @@ def match_extracted_chapters(
     substantive = [
         match
         for match in matches
-        if _should_keep_chapter_match(match.source_chapter, match.target_chapter)
+        if _should_keep_chapter_match(
+            match.source_chapter,
+            match.target_chapter,
+            chapter_match_mode=chapter_match_mode,
+        )
     ]
     return substantive or matches
 
@@ -193,6 +213,7 @@ def _chapter_pair_score(
     tgt_idx: int,
     src_total: int,
     tgt_total: int,
+    chapter_match_mode: str,
 ) -> float:
     return max(
         0.0,
@@ -204,6 +225,7 @@ def _chapter_pair_score(
             tgt_idx=tgt_idx,
             src_total=src_total,
             tgt_total=tgt_total,
+            chapter_match_mode=chapter_match_mode,
         ),
     )
 
@@ -216,18 +238,20 @@ def _chapter_pair_cost(
     tgt_idx: int,
     src_total: int,
     tgt_total: int,
+    chapter_match_mode: str,
 ) -> float:
     src_count = max(source_chapter.sentence_count, 1)
     tgt_count = max(target_chapter.sentence_count, 1)
     count_cost = abs(math.log((src_count + 5) / (tgt_count + 5)))
 
-    src_paratext = _looks_like_paratext(source_chapter)
-    tgt_paratext = _looks_like_paratext(target_chapter)
     paratext_cost = 0.0
-    if src_paratext != tgt_paratext:
-        paratext_cost += 1.2
-    elif src_paratext and tgt_paratext:
-        paratext_cost += 0.4
+    if chapter_match_mode == 'structured':
+        src_paratext = _looks_like_paratext(source_chapter)
+        tgt_paratext = _looks_like_paratext(target_chapter)
+        if src_paratext != tgt_paratext:
+            paratext_cost += 1.2
+        elif src_paratext and tgt_paratext:
+            paratext_cost += 0.4
 
     src_marker = _chapter_marker(source_chapter)
     tgt_marker = _chapter_marker(target_chapter)
@@ -243,6 +267,8 @@ def _chapter_pair_cost(
 
 def _chapter_skip_penalty(
     chapter: ExtractedChapter,
+    *,
+    chapter_match_mode: str,
 ) -> float:
     count = chapter.sentence_count
     if count >= 120:
@@ -253,7 +279,7 @@ def _chapter_skip_penalty(
         base = 1.2
     else:
         base = 0.4
-    if _looks_like_paratext(chapter):
+    if chapter_match_mode == 'structured' and _looks_like_paratext(chapter):
         return base * 0.25
     return base
 
@@ -261,7 +287,11 @@ def _chapter_skip_penalty(
 def _should_keep_chapter_match(
     source_chapter: ExtractedChapter,
     target_chapter: ExtractedChapter,
+    *,
+    chapter_match_mode: str,
 ) -> bool:
+    if chapter_match_mode != 'structured':
+        return True
     if source_chapter.sentence_count >= 20 or target_chapter.sentence_count >= 20:
         return True
     return not (_looks_like_paratext(source_chapter) or _looks_like_paratext(target_chapter))
@@ -328,6 +358,7 @@ def align_extracted_chapters(
     *,
     source_lang: str,
     target_lang: str,
+    chapter_match_mode: str = 'structured',
     aligner: BaseAligner | None = None,
 ) -> AlignmentResult:
     """Align extracted chapters in spine order."""
@@ -338,7 +369,11 @@ def align_extracted_chapters(
     )
 
     pairs = []
-    chapter_matches = match_extracted_chapters(source_chapters, target_chapters)
+    chapter_matches = match_extracted_chapters(
+        source_chapters,
+        target_chapters,
+        chapter_match_mode=chapter_match_mode,
+    )
     for chapter_match in chapter_matches:
         chapter_result = align_segments(
             chapter_match.source_chapter.segments,
@@ -364,6 +399,7 @@ def align_books(
     *,
     source_lang: str,
     target_lang: str,
+    chapter_match_mode: str = 'structured',
     aligner: BaseAligner | None = None,
 ) -> AlignmentResult:
     """Extract and align two books chapter by chapter."""
@@ -375,6 +411,7 @@ def align_books(
         target_chapters,
         source_lang=source_lang,
         target_lang=target_lang,
+        chapter_match_mode=chapter_match_mode,
         aligner=aligner,
     )
 
@@ -386,9 +423,16 @@ def run_bilingual_epub_pipeline(
     output_path: str | Path,
     source_lang: str = 'ja',
     target_lang: str = 'zh',
+    builder_mode: str = 'simple',
+    chapter_match_mode: str = 'structured',
+    layout_direction: str = 'horizontal',
+    emit_translation_metadata: bool = False,
     aligner: BaseAligner | None = None,
 ) -> AlignmentResult:
     """Run the end-to-end pipeline and write a bilingual EPUB."""
+
+    if layout_direction not in {'horizontal', 'source'}:
+        raise ValueError(f'Unsupported layout_direction: {layout_direction}')
 
     source_book = read_epub(source_epub_path)
     target_book = read_epub(target_epub_path)
@@ -398,12 +442,25 @@ def run_bilingual_epub_pipeline(
         target_book,
         source_lang=source_lang,
         target_lang=target_lang,
+        chapter_match_mode=chapter_match_mode,
         aligner=aligner,
     )
-    build_bilingual_epub(
-        alignment=alignment,
-        source_book=source_book,
-        target_book=target_book,
-        output_path=Path(output_path),
-    )
+    if builder_mode == 'simple':
+        build_bilingual_epub(
+            alignment=alignment,
+            source_book=source_book,
+            target_book=target_book,
+            output_path=Path(output_path),
+        )
+    elif builder_mode == 'source_layout':
+        build_bilingual_epub_on_source_layout(
+            alignment=alignment,
+            source_book=source_book,
+            target_book=target_book,
+            output_path=Path(output_path),
+            layout_direction=layout_direction,
+            emit_translation_metadata=emit_translation_metadata,
+        )
+    else:
+        raise ValueError(f'Unsupported builder_mode: {builder_mode}')
     return alignment

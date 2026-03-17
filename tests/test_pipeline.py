@@ -116,6 +116,41 @@ def test_match_extracted_chapters_skips_front_and_back_matter():
     assert [match.target_chapter.spine_idx for match in matches] == [1, 2]
 
 
+def test_match_extracted_chapters_raw_mode_keeps_paratext_candidates():
+    source_book = _book(
+        'Source',
+        'ja',
+        [
+            ('封面', '<p>金閣寺</p>'),
+            ('第一章', _paragraphs(60, '原一')),
+            ('第二章', _paragraphs(58, '原二')),
+            ('注解', '<p>注解。</p>'),
+        ],
+    )
+    target_book = _book(
+        'Target',
+        'zh',
+        [
+            ('版权', '<p>书籍信息</p>'),
+            ('第一章', _paragraphs(57, '译一')),
+            ('第二章', _paragraphs(61, '译二')),
+            ('后记', '<p>译后记。</p>'),
+        ],
+    )
+
+    source_chapters = extract_sentence_chapters(source_book, language='ja')
+    target_chapters = extract_sentence_chapters(target_book, language='zh')
+    matches = match_extracted_chapters(
+        source_chapters,
+        target_chapters,
+        chapter_match_mode='raw',
+    )
+
+    assert len(matches) == 4
+    assert [match.source_chapter.spine_idx for match in matches] == [0, 1, 2, 3]
+    assert [match.target_chapter.spine_idx for match in matches] == [0, 1, 2, 3]
+
+
 def test_align_books_uses_chapter_matching_before_sentence_alignment():
     source_book = _book(
         'Source',
@@ -143,6 +178,7 @@ def test_align_books_uses_chapter_matching_before_sentence_alignment():
         target_book,
         source_lang='ja',
         target_lang='zh',
+        chapter_match_mode='structured',
         aligner=aligner,
     )
 

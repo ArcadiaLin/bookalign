@@ -1,7 +1,7 @@
 [project]
 name = "bookalign"
 version = "0.1.0"
-description = "Add your description here"
+description = "Sentence-level EPUB extraction, bilingual alignment, and EPUB rebuilding."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

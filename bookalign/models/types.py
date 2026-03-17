@@ -44,6 +44,9 @@ class Segment:
     chapter_idx: int
     paragraph_idx: int
     sentence_idx: int | None
+    paragraph_cfi: str = ''
+    text_start: int | None = None
+    text_end: int | None = None
     raw_html: str = ''
     element_xpath: str = ''
     spans: list[TextSpan] = field(default_factory=list)

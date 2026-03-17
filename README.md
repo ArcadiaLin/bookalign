@@ -1,324 +1,154 @@
 # BookAlign
 
-BookAlign 的最终目标，是把一部作品的原版 EPUB 和人工译版 EPUB 做结构化抽取、句段对齐，并重建成可直接阅读的双语 EPUB。
+BookAlign 用于把原版 EPUB 与译本 EPUB 做句子级抽取、双语对齐，并重建为可阅读的双语 EPUB。
 
-当前项目已经具备一条可实际运行的句子级主链路：
-
-```text
-原版 EPUB + 译版 EPUB
-→ 句子级 Segment 抽取
-→ 基于 bertalign 的双语对齐
-→ 生成新的双语 EPUB
-```
-
-这条链路已经在 `books/` 中的《金阁寺》日文原版与中文译本上跑通，并产出了一版真实双语 EPUB。
-
-不过，当前 builder 仍然是“生成一部新的双语阅读 EPUB”，还不是“结构保真地回写进原书 XHTML”。
-
-## 最终目标
-
-项目最终希望提供一条完整链路：
+当前主链路已经可运行：
 
 ```text
-原版 EPUB + 译版 EPUB
-→ 结构化抽取
-→ 句段级对齐
-→ 双语内容重建
-→ 可在阅读器中直接打开的双语 EPUB
+source EPUB + target EPUB
+-> sentence-level extraction with CFI anchors
+-> chapter matching
+-> Bertalign sentence alignment
+-> bilingual EPUB build
 ```
 
-最终产物的理想形态是：
+项目当前重点已经从 extractor 单点验证推进到完整工程链路，尤其是：
 
-1. 支持段落级或句子级双语对照
-2. 保留原书章节结构和尽可能多的可用样式信息
-3. 保持原文与译文的可回溯定位能力
-4. 能适应不同 EPUB 来源和不同 XHTML 风格
+- 基于 `Segment` 的句子级对齐
+- 基于 `CFI` 的 source-layout 回写
+- 双 builder 模式
+- 《金阁寺》日文原版 / 中文译本真实书籍验证
 
-## 当前阶段目标
+## 当前能力
 
-当前阶段不追求“语义完美挑出正文”，而是优先把底层能力做稳：
+### 1. EPUB 读取与抽取
 
-1. 从结构相对健康的 EPUB 中抽出可对齐的段落和句子
-2. 对常见噪音做规则层面的过滤和降噪
-3. 用 `CFI` 保存稳定的文本范围锚点
-4. 保证段落级和句子级抽取逻辑一致
-5. 为后续语义对齐模块提供尽可能干净的输入
+- 按 spine 顺序读取正文 XHTML
+- 基于规则和策略抽取可读段落
+- 在段落上继续切成句子级 `Segment`
+- 为段落和句子生成可回溯的 `CFI`
 
-这一步的边界是明确的：
+### 2. 双语对齐
 
-1. 这里只做启发式抽取，不做完整语义理解
-2. 后续更高层的正文甄别、对齐修正、生成控制，交给后续模块
+- `BertalignAdapter` 封装 vendored `bertalign`
+- 章节级 DP 匹配，避免原书/译本 frontmatter 直接错配
+- 支持 `structured` 和 `raw` 两种章节匹配模式
 
-## 当前已经实现的能力
+### 3. EPUB 构建
 
-### EPUB 读取
+- `simple` 模式：生成新的双语对照书
+- `source_layout` 模式：保留 source XHTML 结构，在原段落后写回译文
+- `source_layout + horizontal` 模式下，会把输出书的阅读方向改为 `ltr`，避免部分阅读器沿用原日文 `rtl` 翻页语义
 
-- 读取 EPUB
-- 获取按 spine 顺序排列的 XHTML 文档
-- 提取基础元数据
+## 当前边界
 
-代码：
+- 还没有做句内 inline 级别的精确回写，当前仍是“按 source 段落后插入译文段落”
+- 章节匹配仍以结构和启发式为主，不是跨章语义全局优化
+- 对复杂诗排、图文页、极差 EPUB 的兼容还不完整
 
-- [reader.py](/home/arcadia/projs/bookalign/bookalign/epub/reader.py)
-
-### 规则驱动抽取
-
-当前抽取层已经升级为“规则 + 策略”模型，而不只是简单的 skip filter。
-
-支持：
-
-1. `ElementPolicy`
-2. `ExtractAction`
-3. 标签级与属性级联合匹配
-4. 节点行为分发，而不是散落在 extractor 里的标签特判
-
-典型行为：
-
-1. `ruby` 保留 base text
-2. `rt/rp` 跳过
-3. `span.super`、`a.noteref`、footnote / toc 容器跳过
-4. `br` 作为轻量分隔信号
-5. 结构容器不直接当正文段落
-
-代码：
-
-- [tag_filters.py](/home/arcadia/projs/bookalign/bookalign/epub/tag_filters.py)
-
-### 段落与句子级 Segment 生成
-
-当前主模型是 `Segment`。
-
-它保存：
-
-1. `text`
-2. `cfi`
-3. `chapter_idx`
-4. `paragraph_idx`
-5. `sentence_idx`
-6. `raw_html`
-
-并通过 `TextSpan` 保留句级切片和 CFI 映射所需的 trace 信息。
-
-代码：
-
-- [extractor.py](/home/arcadia/projs/bookalign/bookalign/epub/extractor.py)
-- [types.py](/home/arcadia/projs/bookalign/bookalign/models/types.py)
-
-### CFI 主定位
-
-当前运行时主定位方式是 `CFI`，不是 `XPath`。
-
-已经支持：
-
-1. 生成段落级 range CFI
-2. 生成句子级 range CFI
-3. 用 `extract_text_from_cfi()` 做 roundtrip 回提
-
-代码：
-
-- [cfi.py](/home/arcadia/projs/bookalign/bookalign/epub/cfi.py)
-
-### 多语言分句
-
-当前支持：
-
-1. `ja`
-2. `zh`
-3. `en`
-4. `es`
-
-并做了：
-
-1. CJK 标点切分
-2. 英西文 `pysbd` 切分
-3. 对白 / 引号边界后处理
-4. `br` 较多段落的 line-aware 启发式切分
-
-代码：
-
-- [sentence_splitter.py](/home/arcadia/projs/bookalign/bookalign/epub/sentence_splitter.py)
-
-### 句子级对齐
-
-当前对齐层已经可用，核心能力包括：
-
-1. `BaseAligner` 统一接口
-2. `BertalignAdapter` 对 vendored `bertalign` 的封装
-3. chapter-by-chapter 的句子级对齐
-4. 可跳过 frontmatter / backmatter 的章节匹配
-
-代码：
-
-- [base.py](/home/arcadia/projs/bookalign/bookalign/align/base.py)
-- [aligner.py](/home/arcadia/projs/bookalign/bookalign/align/aligner.py)
-- [bertalign_adapter.py](/home/arcadia/projs/bookalign/bookalign/align/bertalign_adapter.py)
-- [pipeline.py](/home/arcadia/projs/bookalign/bookalign/pipeline.py)
-
-### 双语 EPUB 生成
-
-当前 builder 已能根据 `AlignmentResult` 生成新的双语 EPUB：
-
-1. 按章节输出新的 XHTML 页面
-2. 以句对方式展示原文和译文
-3. 支持 source-only / target-only 占位
-4. 提供稳定的章节标题 fallback
-
-代码：
-
-- [builder.py](/home/arcadia/projs/bookalign/bookalign/epub/builder.py)
-- [cli.py](/home/arcadia/projs/bookalign/bookalign/cli.py)
-
-### 测试与人工审阅
-
-项目已经具备两类验证能力：
-
-1. 程序化测试
-2. Markdown 报告 + reader-style 审阅
-
-调试报告入口：
-
-- [debug_report.py](/home/arcadia/projs/bookalign/bookalign/epub/debug_report.py)
-
-相关测试：
-
-- [test_splitter.py](/home/arcadia/projs/bookalign/tests/test_splitter.py)
-- [test_extractor.py](/home/arcadia/projs/bookalign/tests/test_extractor.py)
-
-## 当前项目边界
-
-当前明确暂不解决的问题：
-
-1. 诗行 / 诗歌排版保真
-2. 对所有 EPUB 的语义级正文识别
-3. 对极差 EPUB 的完全修复型抽取
-4. 图像页 EPUB 的 OCR 或图文恢复
-
-这意味着 BookAlign 当前的抽取层目标不是“任何 EPUB 都完美恢复正文”，而是：
-
-1. 对结构健康的 EPUB，尽量抽出可对齐句子
-2. 对结构不健康的 EPUB，尽量减少噪音污染
-3. 把剩余问题留给更高层的语义任务或后续适配层
-
-## 接下来将继续朝什么方向推进
-
-之后的工作，将继续围绕最终目标推进，但顺序会保持清晰：
-
-### 第一优先级
-
-继续增强抽取层的可用性和可适配性：
-
-1. EPUB 类型 / 生成器风格适配
-2. paratext / navigation / backmatter 的候选过滤
-3. 句界规则的继续收敛
-
-### 第二优先级
-
-把抽取结果接入真正的对齐链路：
-
-1. 扩展章节匹配与对齐后处理
-2. 增加对齐质量审阅与修正能力
-3. 段级 / 句级双模式对齐
-
-### 第三优先级
-
-落地重建与交付链路：
-
-1. 更保真的 builder / rewriter
-2. 基于 source CFI 的回写方案
-3. 更稳定的 CLI / pipeline 交付体验
-4. 双语 EPUB 输出质量提升
-
-## 当前目录
-
-主代码：
+## 目录结构
 
 ```text
 bookalign/
-├── epub/
-├── models/
-├── align/
-├── cli.py
-└── pipeline.py
+├── align/          # 对齐抽象与 bertalign 适配
+├── epub/           # 读取、CFI、抽取、builder、审阅报告
+├── models/         # Segment / AlignmentResult 等共享数据模型
+├── cli.py          # CLI 入口
+└── pipeline.py     # 端到端编排
+
+books/              # 本地测试用 EPUB
+scripts/            # 环境准备和运行时 smoke test
+tests/              # pytest
+tests/artifacts/    # 仅保留 batch_reader_reports 作为提交产物
 ```
 
-测试与审阅：
+## 环境
 
-```text
-tests/
-├── test_extractor.py
-├── test_splitter.py
-├── test_aligner.py
-├── test_builder.py
-└── artifacts/
+- Python `3.12`
+- 包管理器 `uv`
+- 对齐运行时依赖位于 `align` 依赖组
+- 本地 LaBSE 模型路径当前优先使用 `/root/model/LaBSE`
+
+## 安装
+
+基础开发环境：
+
+```bash
+uv sync --group dev
 ```
 
-文档：
+含对齐运行时：
 
-```text
-README.md
-DESIGN.md
-STATUS.md
-EPUB_EXTRACTION.md
-EXTRACTION_REFACTOR.md
+```bash
+uv sync --group dev --group align
 ```
 
-## 开发说明
+## 常用命令
 
-运行当前抽取相关测试：
+运行测试：
+
+```bash
+uv run pytest
+```
+
+快速验证抽取：
 
 ```bash
 uv run pytest tests/test_splitter.py tests/test_extractor.py -q
 ```
 
-运行当前全量测试：
+查看 debug report CLI：
 
 ```bash
-uv run pytest -q
+uv run python -m bookalign.epub.debug_report --help
 ```
 
-运行《金阁寺》日文原版 + 中文译本的真实双语 EPUB 生成：
+运行端到端双语 EPUB：
 
 ```bash
-PYTHONPATH=. HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run python - <<'PY'
-from pathlib import Path
-
-from bookalign.align.bertalign_adapter import BertalignAdapter
-from bookalign.pipeline import run_bilingual_epub_pipeline
-
-run_bilingual_epub_pipeline(
-    source_epub_path=Path('books/金閣寺 (三島由紀夫) (Z-Library).epub'),
-    target_epub_path=Path('books/金阁寺 (三岛由纪夫) (Z-Library).epub'),
-    output_path=Path('tests/artifacts/kinkaku_ja_zh_bertalign.epub'),
-    source_lang='ja',
-    target_lang='zh',
-    aligner=BertalignAdapter(
-        model_name='/root/model/LaBSE',
-        src_lang='ja',
-        tgt_lang='zh',
-    ),
-)
-PY
+uv run bookalign \
+  "books/金閣寺 (三島由紀夫) (Z-Library).epub" \
+  "books/金阁寺 (三岛由纪夫) (Z-Library).epub" \
+  tests/artifacts/kinkaku_ja_zh_source_layout.epub \
+  --source-lang ja \
+  --target-lang zh \
+  --builder-mode source_layout \
+  --chapter-match-mode structured \
+  --layout-direction horizontal
 ```
 
-说明：
-
-1. 上面的命令默认使用本地模型目录 `/root/model/LaBSE`
-2. 当前推荐先离线运行，避免自动触发 Hugging Face 下载
-
-生成 Markdown 抽样报告：
+输出简单句对版：
 
 ```bash
-python -m bookalign.epub.debug_report \
-  --book kinkaku.epub \
-  --seed 20260315 \
-  --sample-count 5 \
-  --test-type complex \
-  --granularity sentence \
-  --language ja \
-  --debug \
-  --output tests/artifacts/sample_report.md
+uv run bookalign \
+  "books/金閣寺 (三島由紀夫) (Z-Library).epub" \
+  "books/金阁寺 (三岛由纪夫) (Z-Library).epub" \
+  tests/artifacts/kinkaku_ja_zh_simple.epub \
+  --source-lang ja \
+  --target-lang zh \
+  --builder-mode simple
 ```
 
-## 一句话总结
+## 验证状态
 
-BookAlign 当前不是“已经完成的双语 EPUB 工具”，而是一个正在向“可稳定抽取、可定位、可对齐、可重建的双语 EPUB 系统”推进的工程。后续工作将继续以这个目标为准，而不是只做零散脚本修补。
+当前主链路已经在《金阁寺》原文/译本上真实跑通，并完成过以下验证：
+
+- 章节匹配可避开前后附文
+- Bertalign 实际产出句对
+- `simple` 和 `source_layout` 两种 builder 均可生成 EPUB
+- `source_layout` 横排输出已修复阅读方向和分页兼容性问题
+
+最新测试状态见 `STATUS.md`。
+
+## 文档
+
+- `README.md`: 项目总览与上手
+- `DESIGN.md`: 架构与设计决策
+- `STATUS.md`: 当前进度、验证状态、下一步
+- `TECHNICAL.md`: 详细技术说明，包含接口、数据结构、流程和原理
+
+## 提交与产物策略
+
+- `books/` 视为本地测试材料，不新增大体积书籍
+- `tests/artifacts/` 默认不提交生成物
+- 当前保留的提交级人工审阅产物只有 `tests/artifacts/batch_reader_reports/`
