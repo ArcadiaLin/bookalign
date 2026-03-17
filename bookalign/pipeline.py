@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
+import re
 
 from ebooklib import epub
 
@@ -24,6 +26,52 @@ class ExtractedChapter:
     spine_idx: int
     doc: epub.EpubHtml
     segments: list[Segment]
+
+    @property
+    def sentence_count(self) -> int:
+        return len(self.segments)
+
+
+@dataclass
+class ChapterMatch:
+    """A matched source/target chapter pair used for sentence alignment."""
+
+    source_chapter: ExtractedChapter
+    target_chapter: ExtractedChapter
+    score: float
+
+
+_PARATEXT_TITLE_RE = re.compile(
+    r'(?:'
+    r'cover|title|toc|contents|copyright|license|colophon|preface|foreword|'
+    r'acknowledg|appendix|index|about|notes?|postscript|afterword|section0+|'
+    r'封面|版权|版權|目录|目次|书籍信息|書籍情報|说明|說明|前言|后记|後記|译后记|譯後記|'
+    r'附录|附錄|附记|附記|注\s*解|註\s*解|解説|解說|年\s*谱|年\s*譜|'
+    r'参考文献|參考文獻|人と文学|について|表紙|奥付|あとがき'
+    r')',
+    re.IGNORECASE,
+)
+_CHAPTER_MARKER_RE = re.compile(r'第?\s*([0-9]+|[一二三四五六七八九十百千〇零两兩]+)\s*[章节回部篇卷]?')
+_CJK_NUMERALS = {
+    '零': 0,
+    '〇': 0,
+    '一': 1,
+    '二': 2,
+    '两': 2,
+    '兩': 2,
+    '三': 3,
+    '四': 4,
+    '五': 5,
+    '六': 6,
+    '七': 7,
+    '八': 8,
+    '九': 9,
+}
+_CJK_UNITS = {
+    '十': 10,
+    '百': 100,
+    '千': 1000,
+}
 
 
 def extract_sentence_chapters(
@@ -53,6 +101,227 @@ def extract_sentence_chapters(
     return chapters
 
 
+def match_extracted_chapters(
+    source_chapters: list[ExtractedChapter],
+    target_chapters: list[ExtractedChapter],
+) -> list[ChapterMatch]:
+    """Match chapter sequences while allowing front/back matter skips."""
+
+    src_len = len(source_chapters)
+    tgt_len = len(target_chapters)
+    scores = [[math.inf] * (tgt_len + 1) for _ in range(src_len + 1)]
+    back: list[list[tuple[str, int, int] | None]] = [
+        [None] * (tgt_len + 1) for _ in range(src_len + 1)
+    ]
+    scores[0][0] = 0.0
+
+    for i in range(src_len + 1):
+        for j in range(tgt_len + 1):
+            current = scores[i][j]
+            if math.isinf(current):
+                continue
+
+            if i < src_len:
+                skip_source = current + _chapter_skip_penalty(source_chapters[i])
+                if skip_source < scores[i + 1][j]:
+                    scores[i + 1][j] = skip_source
+                    back[i + 1][j] = ('skip_source', i, j)
+
+            if j < tgt_len:
+                skip_target = current + _chapter_skip_penalty(target_chapters[j])
+                if skip_target < scores[i][j + 1]:
+                    scores[i][j + 1] = skip_target
+                    back[i][j + 1] = ('skip_target', i, j)
+
+            if i < src_len and j < tgt_len:
+                pair_cost = current + _chapter_pair_cost(
+                    source_chapters[i],
+                    target_chapters[j],
+                    src_idx=i,
+                    tgt_idx=j,
+                    src_total=src_len,
+                    tgt_total=tgt_len,
+                )
+                if pair_cost < scores[i + 1][j + 1]:
+                    scores[i + 1][j + 1] = pair_cost
+                    back[i + 1][j + 1] = ('match', i, j)
+
+    matches: list[ChapterMatch] = []
+    i = src_len
+    j = tgt_len
+    while i > 0 or j > 0:
+        move = back[i][j]
+        if move is None:
+            break
+
+        op, prev_i, prev_j = move
+        if op == 'match':
+            source_chapter = source_chapters[prev_i]
+            target_chapter = target_chapters[prev_j]
+            matches.append(
+                ChapterMatch(
+                    source_chapter=source_chapter,
+                    target_chapter=target_chapter,
+                    score=_chapter_pair_score(
+                        source_chapter,
+                        target_chapter,
+                        src_idx=prev_i,
+                        tgt_idx=prev_j,
+                        src_total=src_len,
+                        tgt_total=tgt_len,
+                    ),
+                )
+            )
+
+        i = prev_i
+        j = prev_j
+
+    matches.reverse()
+    substantive = [
+        match
+        for match in matches
+        if _should_keep_chapter_match(match.source_chapter, match.target_chapter)
+    ]
+    return substantive or matches
+
+
+def _chapter_pair_score(
+    source_chapter: ExtractedChapter,
+    target_chapter: ExtractedChapter,
+    *,
+    src_idx: int,
+    tgt_idx: int,
+    src_total: int,
+    tgt_total: int,
+) -> float:
+    return max(
+        0.0,
+        3.0
+        - _chapter_pair_cost(
+            source_chapter,
+            target_chapter,
+            src_idx=src_idx,
+            tgt_idx=tgt_idx,
+            src_total=src_total,
+            tgt_total=tgt_total,
+        ),
+    )
+
+
+def _chapter_pair_cost(
+    source_chapter: ExtractedChapter,
+    target_chapter: ExtractedChapter,
+    *,
+    src_idx: int,
+    tgt_idx: int,
+    src_total: int,
+    tgt_total: int,
+) -> float:
+    src_count = max(source_chapter.sentence_count, 1)
+    tgt_count = max(target_chapter.sentence_count, 1)
+    count_cost = abs(math.log((src_count + 5) / (tgt_count + 5)))
+
+    src_paratext = _looks_like_paratext(source_chapter)
+    tgt_paratext = _looks_like_paratext(target_chapter)
+    paratext_cost = 0.0
+    if src_paratext != tgt_paratext:
+        paratext_cost += 1.2
+    elif src_paratext and tgt_paratext:
+        paratext_cost += 0.4
+
+    src_marker = _chapter_marker(source_chapter)
+    tgt_marker = _chapter_marker(target_chapter)
+    marker_cost = 0.0
+    if src_marker is not None and tgt_marker is not None:
+        marker_cost += -0.8 if src_marker == tgt_marker else 2.0
+    elif src_marker is not None or tgt_marker is not None:
+        marker_cost += 0.35
+
+    position_cost = abs((src_idx + 1) / src_total - (tgt_idx + 1) / tgt_total) * 0.75
+    return max(0.0, count_cost + paratext_cost + marker_cost + position_cost)
+
+
+def _chapter_skip_penalty(
+    chapter: ExtractedChapter,
+) -> float:
+    count = chapter.sentence_count
+    if count >= 120:
+        base = 4.0
+    elif count >= 40:
+        base = 2.5
+    elif count >= 12:
+        base = 1.2
+    else:
+        base = 0.4
+    if _looks_like_paratext(chapter):
+        return base * 0.25
+    return base
+
+
+def _should_keep_chapter_match(
+    source_chapter: ExtractedChapter,
+    target_chapter: ExtractedChapter,
+) -> bool:
+    if source_chapter.sentence_count >= 20 or target_chapter.sentence_count >= 20:
+        return True
+    return not (_looks_like_paratext(source_chapter) or _looks_like_paratext(target_chapter))
+
+
+def _looks_like_paratext(chapter: ExtractedChapter) -> bool:
+    label = _chapter_label(chapter).casefold()
+    if _PARATEXT_TITLE_RE.search(label):
+        return True
+    preview = ' '.join(segment.text for segment in chapter.segments[:3]).casefold()
+    if _PARATEXT_TITLE_RE.search(preview):
+        return True
+    return False
+
+
+def _chapter_marker(chapter: ExtractedChapter) -> int | None:
+    title = (getattr(chapter.doc, 'title', '') or '').strip()
+    if not title:
+        return None
+    match = _CHAPTER_MARKER_RE.search(title)
+    if not match:
+        return None
+    token = match.group(1)
+    if token.isdigit():
+        return int(token)
+    return _parse_cjk_numeral(token)
+
+
+def _chapter_label(chapter: ExtractedChapter) -> str:
+    title = (getattr(chapter.doc, 'title', '') or '').strip()
+    if title:
+        return title
+    if hasattr(chapter.doc, 'get_name'):
+        return chapter.doc.get_name()
+    return ''
+
+
+def _parse_cjk_numeral(token: str) -> int | None:
+    if not token:
+        return None
+    if all(char in _CJK_NUMERALS for char in token):
+        value = 0
+        for char in token:
+            value = value * 10 + _CJK_NUMERALS[char]
+        return value
+
+    total = 0
+    current = 0
+    for char in token:
+        if char in _CJK_NUMERALS:
+            current = _CJK_NUMERALS[char]
+            continue
+        unit = _CJK_UNITS.get(char)
+        if unit is None:
+            return None
+        total += (current or 1) * unit
+        current = 0
+    return total + current
+
+
 def align_extracted_chapters(
     source_chapters: list[ExtractedChapter],
     target_chapters: list[ExtractedChapter],
@@ -69,10 +338,11 @@ def align_extracted_chapters(
     )
 
     pairs = []
-    for source_chapter, target_chapter in zip(source_chapters, target_chapters):
+    chapter_matches = match_extracted_chapters(source_chapters, target_chapters)
+    for chapter_match in chapter_matches:
         chapter_result = align_segments(
-            source_chapter.segments,
-            target_chapter.segments,
+            chapter_match.source_chapter.segments,
+            chapter_match.target_chapter.segments,
             source_lang=source_lang,
             target_lang=target_lang,
             granularity='sentence',
@@ -114,8 +384,8 @@ def run_bilingual_epub_pipeline(
     source_epub_path: str | Path,
     target_epub_path: str | Path,
     output_path: str | Path,
-    source_lang: str = 'zh',
-    target_lang: str = 'ja',
+    source_lang: str = 'ja',
+    target_lang: str = 'zh',
     aligner: BaseAligner | None = None,
 ) -> AlignmentResult:
     """Run the end-to-end pipeline and write a bilingual EPUB."""

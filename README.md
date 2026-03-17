@@ -2,7 +2,18 @@
 
 BookAlign 的最终目标，是把一部作品的原版 EPUB 和人工译版 EPUB 做结构化抽取、句段对齐，并重建成可直接阅读的双语 EPUB。
 
-当前项目还没有完成整条双语生成链路，但抽取层已经是主线，并且后续工作也将继续围绕这个最终目标推进：先稳定抽取与定位，再接入对齐与重建。
+当前项目已经具备一条可实际运行的句子级主链路：
+
+```text
+原版 EPUB + 译版 EPUB
+→ 句子级 Segment 抽取
+→ 基于 bertalign 的双语对齐
+→ 生成新的双语 EPUB
+```
+
+这条链路已经在 `books/` 中的《金阁寺》日文原版与中文译本上跑通，并产出了一版真实双语 EPUB。
+
+不过，当前 builder 仍然是“生成一部新的双语阅读 EPUB”，还不是“结构保真地回写进原书 XHTML”。
 
 ## 最终目标
 
@@ -127,6 +138,36 @@ BookAlign 的最终目标，是把一部作品的原版 EPUB 和人工译版 EPU
 
 - [sentence_splitter.py](/home/arcadia/projs/bookalign/bookalign/epub/sentence_splitter.py)
 
+### 句子级对齐
+
+当前对齐层已经可用，核心能力包括：
+
+1. `BaseAligner` 统一接口
+2. `BertalignAdapter` 对 vendored `bertalign` 的封装
+3. chapter-by-chapter 的句子级对齐
+4. 可跳过 frontmatter / backmatter 的章节匹配
+
+代码：
+
+- [base.py](/home/arcadia/projs/bookalign/bookalign/align/base.py)
+- [aligner.py](/home/arcadia/projs/bookalign/bookalign/align/aligner.py)
+- [bertalign_adapter.py](/home/arcadia/projs/bookalign/bookalign/align/bertalign_adapter.py)
+- [pipeline.py](/home/arcadia/projs/bookalign/bookalign/pipeline.py)
+
+### 双语 EPUB 生成
+
+当前 builder 已能根据 `AlignmentResult` 生成新的双语 EPUB：
+
+1. 按章节输出新的 XHTML 页面
+2. 以句对方式展示原文和译文
+3. 支持 source-only / target-only 占位
+4. 提供稳定的章节标题 fallback
+
+代码：
+
+- [builder.py](/home/arcadia/projs/bookalign/bookalign/epub/builder.py)
+- [cli.py](/home/arcadia/projs/bookalign/bookalign/cli.py)
+
 ### 测试与人工审阅
 
 项目已经具备两类验证能力：
@@ -174,18 +215,18 @@ BookAlign 的最终目标，是把一部作品的原版 EPUB 和人工译版 EPU
 
 把抽取结果接入真正的对齐链路：
 
-1. `align/*` 模块落地
-2. 对齐结果数据结构稳定化
+1. 扩展章节匹配与对齐后处理
+2. 增加对齐质量审阅与修正能力
 3. 段级 / 句级双模式对齐
 
 ### 第三优先级
 
 落地重建与交付链路：
 
-1. `builder`
-2. `pipeline`
-3. `cli`
-4. 双语 EPUB 输出
+1. 更保真的 builder / rewriter
+2. 基于 source CFI 的回写方案
+3. 更稳定的 CLI / pipeline 交付体验
+4. 双语 EPUB 输出质量提升
 
 ## 当前目录
 
@@ -226,8 +267,43 @@ EXTRACTION_REFACTOR.md
 运行当前抽取相关测试：
 
 ```bash
-python -m pytest tests/test_splitter.py tests/test_extractor.py -q
+uv run pytest tests/test_splitter.py tests/test_extractor.py -q
 ```
+
+运行当前全量测试：
+
+```bash
+uv run pytest -q
+```
+
+运行《金阁寺》日文原版 + 中文译本的真实双语 EPUB 生成：
+
+```bash
+PYTHONPATH=. HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 uv run python - <<'PY'
+from pathlib import Path
+
+from bookalign.align.bertalign_adapter import BertalignAdapter
+from bookalign.pipeline import run_bilingual_epub_pipeline
+
+run_bilingual_epub_pipeline(
+    source_epub_path=Path('books/金閣寺 (三島由紀夫) (Z-Library).epub'),
+    target_epub_path=Path('books/金阁寺 (三岛由纪夫) (Z-Library).epub'),
+    output_path=Path('tests/artifacts/kinkaku_ja_zh_bertalign.epub'),
+    source_lang='ja',
+    target_lang='zh',
+    aligner=BertalignAdapter(
+        model_name='/root/model/LaBSE',
+        src_lang='ja',
+        tgt_lang='zh',
+    ),
+)
+PY
+```
+
+说明：
+
+1. 上面的命令默认使用本地模型目录 `/root/model/LaBSE`
+2. 当前推荐先离线运行，避免自动触发 Hugging Face 下载
 
 生成 Markdown 抽样报告：
 

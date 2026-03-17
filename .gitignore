@@ -8,7 +8,7 @@ __pycache__/
 .venv/
 .cache/
 *.xhtml
+.claude
 
 # Local test inputs / downloaded models
-books/
 *.epub

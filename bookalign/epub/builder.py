@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 import html
 from pathlib import Path
+import re
 
 from ebooklib import epub
 
@@ -39,11 +40,16 @@ h1 {
   color: #555;
   font-size: 0.96rem;
 }
+.empty-source,
 .empty-target {
   font-style: italic;
   opacity: 0.72;
 }
 """
+_GENERATED_CHAPTER_NAME_RE = re.compile(
+    r'^(?:chapter[_-]?\d+|section\d+|\d{3,4}|cover|title|contents?)$',
+    re.IGNORECASE,
+)
 
 
 def build_bilingual_epub(
@@ -68,17 +74,21 @@ def build_bilingual_epub(
     out_book.add_item(css_item)
 
     source_docs = {spine_idx: doc for spine_idx, doc in get_spine_documents(source_book)}
+    target_docs = {spine_idx: doc for spine_idx, doc in get_spine_documents(target_book)}
     pairs_by_chapter: dict[int, list[AlignedPair]] = defaultdict(list)
     for pair in alignment.pairs:
-        chapter_idx = _pair_source_chapter(pair)
+        chapter_idx = _pair_chapter_index(pair)
         if chapter_idx is None:
             continue
         pairs_by_chapter[chapter_idx].append(pair)
 
     chapter_items: list[epub.EpubHtml] = []
-    for chapter_idx in sorted(pairs_by_chapter):
-        doc = source_docs.get(chapter_idx)
-        chapter_title = _chapter_title(doc, chapter_idx)
+    for display_idx, chapter_idx in enumerate(sorted(pairs_by_chapter), start=1):
+        chapter_title = _chapter_title(
+            source_docs.get(chapter_idx),
+            target_docs.get(chapter_idx),
+            display_idx,
+        )
         chapter_html = _build_chapter_html(
             chapter_title=chapter_title,
             pairs=pairs_by_chapter[chapter_idx],
@@ -139,13 +149,15 @@ def _build_chapter_html(
         for pair in paragraphs[paragraph_idx]:
             source_text = _join_segment_texts(pair.source)
             target_text = _join_segment_texts(pair.target)
+            source_class = 'source-sentence empty-source' if not source_text else 'source-sentence'
             target_class = 'target-sentence empty-target' if not target_text else 'target-sentence'
+            source_text = source_text or '[原文缺失]'
             target_text = target_text or '[未对齐]'
             body_parts.append(
                 ''.join(
                     [
                         '<div class="sentence-pair">',
-                        f'<p class="source-sentence">{html.escape(source_text)}</p>',
+                        f'<p class="{source_class}">{html.escape(source_text)}</p>',
                         f'<p class="{target_class}">{html.escape(target_text)}</p>',
                         '</div>',
                     ]
@@ -156,37 +168,56 @@ def _build_chapter_html(
     return ''.join(body_parts)
 
 
-def _chapter_title(doc: epub.EpubHtml | None, chapter_idx: int) -> str:
+def _chapter_title(
+    source_doc: epub.EpubHtml | None,
+    target_doc: epub.EpubHtml | None,
+    display_idx: int,
+) -> str:
+    doc = source_doc or target_doc
     if doc is None:
-        return f'Chapter {chapter_idx + 1}'
+        return f'Chapter {display_idx}'
     title = getattr(doc, 'title', '') or ''
-    if title:
+    if title and not _looks_like_generated_chapter_name(title):
         return title
-    name = doc.get_name().rsplit('/', 1)[-1]
-    return name or f'Chapter {chapter_idx + 1}'
+
+    name = doc.get_name().rsplit('/', 1)[-1].rsplit('.', 1)[0]
+    if name and not _looks_like_generated_chapter_name(name):
+        return name
+    return f'Chapter {display_idx}'
 
 
 def _pair_sort_key(pair: AlignedPair) -> tuple[int, int, int]:
-    chapter_idx = _pair_source_chapter(pair) or 0
+    chapter_idx = _pair_chapter_index(pair) or 0
     paragraph_idx = _pair_paragraph_index(pair)
     sentence_idx = min(
-        (segment.sentence_idx or 0 for segment in pair.source),
+        (
+            segment.sentence_idx or 0
+            for segment in (pair.source or pair.target)
+        ),
         default=0,
     )
     return chapter_idx, paragraph_idx, sentence_idx
 
 
-def _pair_source_chapter(pair: AlignedPair) -> int | None:
+def _pair_chapter_index(pair: AlignedPair) -> int | None:
     if pair.source:
         return min(segment.chapter_idx for segment in pair.source)
+    if pair.target:
+        return min(segment.chapter_idx for segment in pair.target)
     return None
 
 
 def _pair_paragraph_index(pair: AlignedPair) -> int:
     if pair.source:
         return min(segment.paragraph_idx for segment in pair.source)
+    if pair.target:
+        return min(segment.paragraph_idx for segment in pair.target)
     return -1
 
 
 def _join_segment_texts(segments) -> str:
     return ' '.join(segment.text.strip() for segment in segments if segment.text.strip())
+
+
+def _looks_like_generated_chapter_name(value: str) -> bool:
+    return bool(_GENERATED_CHAPTER_NAME_RE.fullmatch(value.strip()))

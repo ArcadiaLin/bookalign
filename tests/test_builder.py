@@ -72,3 +72,66 @@ def test_build_bilingual_epub_writes_sentence_level_output(tmp_path: Path):
     assert 'あ。' in content
     assert '乙。' in content
     assert 'い。' in content
+
+
+def test_build_bilingual_epub_keeps_target_only_pairs(tmp_path: Path):
+    source_book = _book('Chinese Source', 'zh', '第一章', '<p>甲。</p>')
+    target_book = _book('Japanese Target', 'ja', '第一章', '<p>あ。</p><p>補句。</p>')
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[_segment('甲。', paragraph_idx=0, sentence_idx=0)],
+                target=[_segment('あ。', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+            AlignedPair(
+                source=[],
+                target=[_segment('補句。', paragraph_idx=1, sentence_idx=0)],
+                score=0.6,
+            ),
+        ],
+        source_lang='zh',
+        target_lang='ja',
+        granularity='sentence',
+    )
+
+    output_path = tmp_path / 'aligned-target-only.epub'
+    build_bilingual_epub(alignment, source_book, target_book, output_path)
+
+    built = read_epub(output_path)
+    docs = get_spine_documents(built)
+    assert len(docs) == 1
+
+    content = docs[0][1].get_content().decode('utf-8')
+    assert '補句。' in content
+    assert '[原文缺失]' in content
+
+
+def test_build_bilingual_epub_uses_stable_fallback_chapter_titles(tmp_path: Path):
+    source_book = _book('Japanese Source', 'ja', '', '<p>甲。</p>')
+    target_book = _book('Chinese Target', 'zh', '', '<p>乙。</p>')
+    source_doc = source_book.spine[0]
+    target_doc = target_book.spine[0]
+    source_doc.file_name = 'xhtml/0004.xhtml'
+    target_doc.file_name = 'Text/chapter01.xhtml'
+
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[_segment('甲。', paragraph_idx=0, sentence_idx=0)],
+                target=[_segment('乙。', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+    )
+
+    output_path = tmp_path / 'aligned-fallback-title.epub'
+    build_bilingual_epub(alignment, source_book, target_book, output_path)
+
+    built = read_epub(output_path)
+    docs = get_spine_documents(built)
+    content = docs[0][1].get_content().decode('utf-8')
+    assert '<h1>Chapter 1</h1>' in content

@@ -16,8 +16,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('source_epub', help='Source EPUB path, for example a Chinese book.')
     parser.add_argument('target_epub', help='Target EPUB path, for example a Japanese translation.')
     parser.add_argument('output_epub', help='Output bilingual EPUB path.')
-    parser.add_argument('--source-lang', default='zh', help='Source language code. Default: zh')
-    parser.add_argument('--target-lang', default='ja', help='Target language code. Default: ja')
+    parser.add_argument('--source-lang', default='ja', help='Source language code. Default: ja')
+    parser.add_argument('--target-lang', default='zh', help='Target language code. Default: zh')
     return parser
 
 
