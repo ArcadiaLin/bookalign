@@ -43,7 +43,7 @@ def extract_segments(
     chapter_idx: int,
     config: TagFilterConfig | None = None,
     splitter: SentenceSplitter | None = None,
-    extract_mode: str = 'filtered',
+    extract_mode: str = 'filtered_preserve',
 ) -> list[Segment]:
     """Extract paragraph or sentence segments from an XHTML document."""
 
@@ -159,7 +159,7 @@ def _should_emit_segment(element, text: str, raw_html: str, config: TagFilterCon
         text,
         raw_html,
         config,
-        extract_mode='filtered',
+        extract_mode='filtered_preserve',
     )
     return should_emit
 
@@ -176,15 +176,13 @@ def _segment_extraction_decision(
     if not normalized:
         return False, 'retain', 'metadata', 'empty'
 
-    if extract_mode == 'full_text':
-        return True, 'align', _classify_paratext_kind(element, normalized, config), ''
+    if extract_mode != 'filtered_preserve':
+        raise ValueError(f'Unsupported extract_mode: {extract_mode}')
 
     paratext_kind, filter_reason = _classify_paratext_kind(element, normalized, config)
     if paratext_kind == 'body':
         return True, 'align', 'body', ''
-    if extract_mode == 'filtered_preserve':
-        return True, 'retain', paratext_kind, filter_reason
-    return False, 'retain', paratext_kind, filter_reason
+    return True, 'retain', paratext_kind, filter_reason
 
 
 def _classify_paratext_kind(element, text: str, config: TagFilterConfig) -> tuple[str, str]:

@@ -18,6 +18,7 @@ from bookalign.epub.cfi import parse_item_xml, resolve_cfi
 from bookalign.epub.debug_report import generate_report
 from bookalign.epub.extractor import (
     _collect_text_spans,
+    _segment_extraction_decision,
     _should_emit_segment,
     collect_debug_spans,
     extract_segments,
@@ -131,7 +132,7 @@ def test_collect_text_spans_applies_policy_actions_consistently():
     assert all('1' not in span.text for span in spans)
 
 
-def test_full_text_profile_keeps_note_refs_and_footnotes():
+def test_filtered_preserve_profile_keeps_note_refs_and_footnotes():
     root = _xml_root(
         """
         <html xmlns:epub="http://www.idpf.org/2007/ops">
@@ -145,7 +146,7 @@ def test_full_text_profile_keeps_note_refs_and_footnotes():
     )
     paragraph = root.xpath('.//*[local-name()="p"]')[0]
     footnote_paragraph = root.xpath('.//*[local-name()="aside"]//*[local-name()="p"]')[0]
-    config = build_tag_filter_config('full_text')
+    config = build_tag_filter_config('filtered_preserve')
 
     paragraph_spans = _collect_text_spans(paragraph, root.getroottree(), config)
     footnote_spans = _collect_text_spans(footnote_paragraph, root.getroottree(), config)
@@ -208,13 +209,13 @@ def test_collect_text_spans_drops_numeric_break_markers():
     assert ''.join(span.text for span in spans).strip() == '第一句 第二句'
 
 
-def test_should_emit_segment_skips_obvious_noise_and_headings():
-    config = TagFilterConfig()
+def test_segment_extraction_decision_retains_noise_and_headings_for_builder():
+    config = build_tag_filter_config('filtered_preserve')
     root = _xml_root(
         """
         <html>
           <body>
-            <p id="license-note">Project Gutenberg trademark license fee</p>
+            <p id="license-meta">Project Gutenberg trademark license fee</p>
             <h1>CHAPTER I</h1>
             <p>这是正常的正文句子。</p>
           </body>
@@ -224,9 +225,27 @@ def test_should_emit_segment_skips_obvious_noise_and_headings():
     noisy = root.xpath('.//*[local-name()="p"]')[0]
     heading = root.xpath('.//*[local-name()="h1"]')[0]
     body = root.xpath('.//*[local-name()="p"]')[1]
-    assert _should_emit_segment(noisy, 'Project Gutenberg trademark license fee', '<p>...</p>', config) is False
-    assert _should_emit_segment(heading, 'CHAPTER I', '<h1>CHAPTER I</h1>', config) is False
-    assert _should_emit_segment(body, '这是正常的正文句子。', '<p>这是正常的正文句子。</p>', config) is True
+    assert _segment_extraction_decision(
+        noisy,
+        'Project Gutenberg trademark license fee',
+        '<p>...</p>',
+        config,
+        extract_mode='filtered_preserve',
+    )[:3] == (True, 'retain', 'metadata')
+    assert _segment_extraction_decision(
+        heading,
+        'CHAPTER I',
+        '<h1>CHAPTER I</h1>',
+        config,
+        extract_mode='filtered_preserve',
+    )[:3] == (True, 'retain', 'chapter_heading')
+    assert _segment_extraction_decision(
+        body,
+        '这是正常的正文句子。',
+        '<p>这是正常的正文句子。</p>',
+        config,
+        extract_mode='filtered_preserve',
+    ) == (True, 'align', 'body', '')
 
 
 def test_collect_text_spans_inserts_space_between_latin_inline_fragments():
@@ -329,7 +348,7 @@ def test_extract_segments_does_not_misclassify_dense_anchor_paragraph_as_navigat
     assert any(segment.text.startswith('美──美這玩意太可怕了！') for segment in segments)
 
 
-def test_extract_segments_full_text_marks_jump_metadata():
+def test_extract_segments_filtered_preserve_marks_jump_metadata():
     book = epub.EpubBook()
     book.set_identifier('jump-metadata-test')
     book.set_title('Jump Metadata Test')
@@ -349,7 +368,7 @@ def test_extract_segments_full_text_marks_jump_metadata():
         doc,
         chapter_idx=chapter_idx,
         splitter=SentenceSplitter(language='zh'),
-        extract_mode='full_text',
+        extract_mode='filtered_preserve',
     )
 
     assert [segment.text for segment in segments] == ['正文1。', '注释正文。']
@@ -389,7 +408,7 @@ def test_extract_segments_filtered_preserve_marks_retained_paratext_without_drop
     assert any(fragment.kind == 'href' and fragment.href == '#note-1' for fragment in segments[1].jump_fragments)
 
 
-def test_extract_segments_skips_blocks_inside_skipped_ancestor_in_filtered_mode():
+def test_extract_segments_filtered_preserve_retains_blocks_inside_annotation_ancestor():
     book = epub.EpubBook()
     book.set_identifier('skipped-ancestor-test')
     book.set_title('Skipped Ancestor Test')
@@ -411,7 +430,8 @@ def test_extract_segments_skips_blocks_inside_skipped_ancestor_in_filtered_mode(
         splitter=SentenceSplitter(language='zh'),
     )
 
-    assert [segment.text for segment in segments] == ['正文。']
+    assert [segment.text for segment in segments] == ['注释正文。', '正文。']
+    assert segments[1].alignment_role == 'align'
 
 
 def _book_path(pattern: str) -> Path:

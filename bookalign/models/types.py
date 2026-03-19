@@ -89,6 +89,6 @@ class AlignmentResult:
     source_lang: str
     target_lang: str
     granularity: str
-    extract_mode: str = 'filtered'
+    extract_mode: str = 'filtered_preserve'
     retained_source_segments: list[Segment] = field(default_factory=list)
     retained_target_segments: list[Segment] = field(default_factory=list)

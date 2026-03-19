@@ -34,7 +34,7 @@ def load_alignment_result(path: str | Path) -> AlignmentResult:
         source_lang=payload.get('source_lang', ''),
         target_lang=payload.get('target_lang', ''),
         granularity=payload.get('granularity', ''),
-        extract_mode=payload.get('extract_mode', 'filtered'),
+        extract_mode=payload.get('extract_mode', 'filtered_preserve'),
         retained_source_segments=[_segment_from_dict(item) for item in payload.get('retained_source_segments', [])],
         retained_target_segments=[_segment_from_dict(item) for item in payload.get('retained_target_segments', [])],
     )

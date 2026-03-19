@@ -19,12 +19,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--source-lang', default='ja', help='Source language code. Default: ja')
     parser.add_argument('--target-lang', default='zh', help='Target language code. Default: zh')
     parser.add_argument(
-        '--extract-mode',
-        default='filtered',
-        choices=('filtered', 'full_text', 'filtered_preserve'),
-        help='Extractor profile. "full_text" aligns all text; "filtered_preserve" keeps filtered text for builder appendix.',
-    )
-    parser.add_argument(
         '--builder-mode',
         default='simple',
         choices=('simple', 'source_layout'),
@@ -40,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
         '--chapter-match-mode',
         default=None,
         choices=('structured', 'raw'),
-        help='Chapter matching strategy. Defaults to "structured" for filtered/filtered_preserve and "raw" for full_text.',
+        help='Chapter matching strategy. Default: structured.',
     )
     parser.add_argument(
         '--alignment-json-input',
@@ -68,6 +62,11 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Keep vertical-form punctuation in target text even when output layout is horizontal.',
     )
+    parser.add_argument(
+        '--enable-local-realign',
+        action='store_true',
+        help='Detect suspicious alignment windows and retry them with more conservative Bertalign settings.',
+    )
     return parser
 
 
@@ -79,7 +78,7 @@ def main() -> None:
         output_path=Path(args.output_epub),
         source_lang=args.source_lang,
         target_lang=args.target_lang,
-        extract_mode=args.extract_mode,
+        extract_mode='filtered_preserve',
         builder_mode=args.builder_mode,
         chapter_match_mode=args.chapter_match_mode,
         alignment_json_input_path=args.alignment_json_input,
@@ -88,6 +87,7 @@ def main() -> None:
         layout_direction=args.layout_direction,
         emit_translation_metadata=args.emit_translation_metadata,
         normalize_vertical_punctuation=not args.disable_vertical_punctuation_normalization,
+        enable_local_realign=args.enable_local_realign,
     )
     print(f'Generated {args.output_epub} with {len(alignment.pairs)} aligned pairs.')
 

@@ -95,12 +95,14 @@ class _ParagraphInjection:
 class SourceLayoutBuilderConfig:
     source_lang: str
     target_lang: str
-    extract_mode: str = 'filtered'
+    extract_mode: str = 'filtered_preserve'
     writeback_mode: str = 'paragraph'
     layout_direction: str = 'horizontal'
     emit_translation_metadata: bool = False
     normalize_vertical_punctuation: bool = True
     note_anchor_map: dict[str, str] = field(default_factory=dict)
+    note_ref_anchor_map: dict[str, str] = field(default_factory=dict)
+    note_ref_doc_map: dict[str, str] = field(default_factory=dict)
     retained_doc_name: str = 'xhtml/bookalign-retained-target.xhtml'
 
 
@@ -246,7 +248,7 @@ def build_bilingual_epub_on_source_layout(
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
     normalize_vertical_punctuation: bool = True,
-    extract_mode: str = 'filtered',
+    extract_mode: str = 'filtered_preserve',
 ) -> None:
     """Write translations back into the source EPUB layout using source CFI anchors.
 
@@ -268,7 +270,8 @@ def build_bilingual_epub_on_source_layout(
         layout_direction=layout_direction,
         emit_translation_metadata=emit_translation_metadata,
         normalize_vertical_punctuation=normalize_vertical_punctuation,
-        note_anchor_map=_build_note_anchor_map(alignment) if extract_mode in {'full_text', 'filtered_preserve'} else {},
+        note_anchor_map=_build_note_anchor_map(alignment),
+        note_ref_anchor_map=_build_note_ref_anchor_map(alignment),
     )
     css_item = _ensure_css_item(
         source_book,
@@ -298,18 +301,13 @@ def build_bilingual_epub_on_source_layout(
         docs=docs,
         config=config,
     )
-    if extract_mode == 'full_text':
-        _append_unmatched_note_segments(
-            alignment=alignment,
-            docs=docs,
-            config=config,
-        )
-    elif extract_mode == 'filtered_preserve':
-        _append_retained_target_document(
-            alignment=alignment,
-            source_book=source_book,
-            config=config,
-        )
+    if extract_mode != 'filtered_preserve':
+        raise ValueError(f'Unsupported extract_mode: {extract_mode}')
+    _append_retained_target_document(
+        alignment=alignment,
+        source_book=source_book,
+        config=config,
+    )
 
     _ensure_navigation_items(source_book)
     epub.write_epub(str(output_path), source_book)
@@ -704,12 +702,23 @@ def _rewrite_retained_subtree(
         mapped_id = config.note_anchor_map.get(element_id)
         if mapped_id:
             element.set('id', mapped_id)
+        elif element_id in config.note_ref_anchor_map:
+            element.set(
+                'id',
+                _register_note_ref_anchor(
+                    anchor_id=element_id,
+                    config=config,
+                    current_doc_name=current_doc_name,
+                ),
+            )
 
     href = (element.get('href') or '').strip()
     if href:
         rewritten = _rewrite_note_href(
             href,
             config.note_anchor_map,
+            note_ref_anchor_map=config.note_ref_anchor_map,
+            note_ref_doc_map=config.note_ref_doc_map,
             current_doc_name=current_doc_name,
             appendix_doc_name=config.retained_doc_name if config.extract_mode == 'filtered_preserve' else '',
         )
@@ -752,20 +761,54 @@ def _join_translation_texts(target_texts: list[str], target_lang: str) -> str:
 
 
 def _build_note_anchor_map(alignment: AlignmentResult) -> dict[str, str]:
+    referenced_note_ids = {
+        fragment.href[1:]
+        for pair in alignment.pairs
+        for segment in pair.target
+        for fragment in segment.jump_fragments
+        if fragment.kind == 'href' and fragment.href.startswith('#')
+    }
     mapping: dict[str, str] = {}
     counter = 1
     target_segments = [
-        *(segment for pair in alignment.pairs for segment in pair.target),
         *alignment.retained_target_segments,
+        *(
+            segment
+            for pair in alignment.pairs
+            if not pair.source
+            for segment in pair.target
+            if segment.is_note_like or segment.has_jump_markup
+        ),
     ]
     for segment in target_segments:
         for fragment in segment.jump_fragments:
             if fragment.kind != 'id' or not fragment.anchor_id:
                 continue
+            if 'backlink' in fragment.anchor_id.casefold():
+                continue
+            if fragment.anchor_id not in referenced_note_ids:
+                continue
             if fragment.anchor_id in mapping:
                 continue
             mapping[fragment.anchor_id] = f'bookalign-note-{counter:04d}'
             counter += 1
+    return mapping
+
+
+def _build_note_ref_anchor_map(alignment: AlignmentResult) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    counter = 1
+    for pair in alignment.pairs:
+        if not pair.source:
+            continue
+        for segment in pair.target:
+            for fragment in segment.jump_fragments:
+                if fragment.kind != 'id' or not fragment.anchor_id:
+                    continue
+                if fragment.anchor_id in mapping:
+                    continue
+                mapping[fragment.anchor_id] = f'bookalign-note-ref-{counter:04d}'
+                counter += 1
     return mapping
 
 
@@ -791,13 +834,15 @@ def _target_joiner(target_lang: str) -> str:
 
 
 def _preserve_target_markup(config: SourceLayoutBuilderConfig) -> bool:
-    return config.extract_mode in {'full_text', 'filtered_preserve'}
+    return config.extract_mode == 'filtered_preserve'
 
 
 def _rewrite_note_href(
     href: str,
     note_anchor_map: dict[str, str],
     *,
+    note_ref_anchor_map: dict[str, str] | None = None,
+    note_ref_doc_map: dict[str, str] | None = None,
     current_doc_name: str = '',
     appendix_doc_name: str = '',
 ) -> str:
@@ -806,11 +851,33 @@ def _rewrite_note_href(
         return normalized
     anchor_id = normalized[1:]
     mapped = note_anchor_map.get(anchor_id)
-    if not mapped:
+    if mapped:
+        if appendix_doc_name and current_doc_name and current_doc_name != appendix_doc_name:
+            return f'{_relative_href(current_doc_name, appendix_doc_name)}#{mapped}'
+        return f'#{mapped}'
+
+    note_ref_anchor_map = note_ref_anchor_map or {}
+    note_ref_doc_map = note_ref_doc_map or {}
+    mapped_ref = note_ref_anchor_map.get(anchor_id)
+    target_doc_name = note_ref_doc_map.get(anchor_id)
+    if not mapped_ref or not target_doc_name:
         return normalized
-    if appendix_doc_name and current_doc_name and current_doc_name != appendix_doc_name:
-        return f'{_relative_href(current_doc_name, appendix_doc_name)}#{mapped}'
-    return f'#{mapped}'
+    if current_doc_name and current_doc_name != target_doc_name:
+        return f'{_relative_href(current_doc_name, target_doc_name)}#{mapped_ref}'
+    return f'#{mapped_ref}'
+
+
+def _register_note_ref_anchor(
+    *,
+    anchor_id: str,
+    config: SourceLayoutBuilderConfig,
+    current_doc_name: str,
+) -> str:
+    mapped = config.note_ref_anchor_map.get(anchor_id)
+    if not mapped:
+        return anchor_id
+    config.note_ref_doc_map.setdefault(anchor_id, current_doc_name)
+    return mapped
 
 
 def _render_target_segments_into(
@@ -844,7 +911,15 @@ def _render_target_segment_into(
     current_doc_name: str = '',
 ) -> None:
     anchor_ids = [
-        config.note_anchor_map.get(fragment.anchor_id, fragment.anchor_id)
+        (
+            _register_note_ref_anchor(
+                anchor_id=fragment.anchor_id,
+                config=config,
+                current_doc_name=current_doc_name,
+            )
+            if current_doc_name and fragment.anchor_id in config.note_ref_anchor_map
+            else config.note_anchor_map.get(fragment.anchor_id, fragment.anchor_id)
+        )
         for fragment in segment.jump_fragments
         if fragment.kind == 'id' and fragment.anchor_id
     ]
@@ -882,6 +957,8 @@ def _render_target_segment_into(
                 _rewrite_note_href(
                     fragment.href,
                     config.note_anchor_map,
+                    note_ref_anchor_map=config.note_ref_anchor_map,
+                    note_ref_doc_map=config.note_ref_doc_map,
                     current_doc_name=current_doc_name,
                     appendix_doc_name=config.retained_doc_name if config.extract_mode == 'filtered_preserve' else '',
                 ),
@@ -1148,7 +1225,20 @@ def _local_tag(tag) -> str:
 
 
 def _is_blank_separator(element) -> bool:
-    return _local_tag(element.tag) == 'p' and len(element) == 1 and _local_tag(element[0].tag) == 'br'
+    if _local_tag(element.tag) != 'p':
+        return False
+    if (element.text or '').strip():
+        return False
+    if len(element) != 1:
+        return False
+    child = element[0]
+    if _local_tag(child.tag) != 'br':
+        return False
+    if (child.text or '').strip():
+        return False
+    if (child.tail or '').strip():
+        return False
+    return True
 
 
 def _rewrite_inline_paragraph(

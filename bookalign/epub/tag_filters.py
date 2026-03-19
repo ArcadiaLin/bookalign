@@ -117,7 +117,7 @@ def _default_policies() -> list[ElementPolicy]:
     ]
 
 
-def _full_text_policies() -> list[ElementPolicy]:
+def _filtered_preserve_policies() -> list[ElementPolicy]:
     policies = [
         policy
         for policy in _default_policies()
@@ -253,20 +253,18 @@ class TagFilterConfig:
         self.policies.extend(legacy_policies)
 
 
-def build_tag_filter_config(extract_mode: str = 'filtered') -> TagFilterConfig:
+def build_tag_filter_config(extract_mode: str = 'filtered_preserve') -> TagFilterConfig:
     """Build an extraction profile configuration."""
 
-    if extract_mode == 'filtered':
-        return TagFilterConfig()
-    if extract_mode in {'full_text', 'filtered_preserve'}:
-        return TagFilterConfig(
-            skip_tags={'rt', 'rp', 'script', 'style', 'svg', 'math', 'img'},
-            skip_classes=set(),
-            skip_rules=[],
-            policies=_full_text_policies(),
-            apply_segment_heuristics=False,
-        )
-    raise ValueError(f'Unsupported extract_mode: {extract_mode}')
+    if extract_mode != 'filtered_preserve':
+        raise ValueError(f'Unsupported extract_mode: {extract_mode}')
+    return TagFilterConfig(
+        skip_tags={'rt', 'rp', 'script', 'style', 'svg', 'math', 'img'},
+        skip_classes=set(),
+        skip_rules=[],
+        policies=_filtered_preserve_policies(),
+        apply_segment_heuristics=False,
+    )
 
 
 def match_element_policy(element, config: TagFilterConfig) -> ElementPolicy | None:

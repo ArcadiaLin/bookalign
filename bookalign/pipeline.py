@@ -84,7 +84,7 @@ def extract_sentence_chapters(
     book: epub.EpubBook,
     *,
     language: str,
-    extract_mode: str = 'filtered',
+    extract_mode: str = 'filtered_preserve',
 ) -> list[ExtractedChapter]:
     """Extract sentence segments from each readable spine document."""
 
@@ -370,6 +370,7 @@ def align_extracted_chapters(
     target_lang: str,
     chapter_match_mode: str = 'structured',
     aligner: BaseAligner | None = None,
+    enable_local_realign: bool = False,
 ) -> AlignmentResult:
     """Align extracted chapters in spine order."""
 
@@ -393,6 +394,15 @@ def align_extracted_chapters(
             granularity='sentence',
             aligner=engine,
         )
+        if enable_local_realign:
+            chapter_result = _realign_suspect_windows(
+                chapter_result,
+                src_segments=chapter_match.source_chapter.alignment_segments,
+                tgt_segments=chapter_match.target_chapter.alignment_segments,
+                source_lang=source_lang,
+                target_lang=target_lang,
+                aligner=engine,
+            )
         pairs.extend(chapter_result.pairs)
 
     return AlignmentResult(
@@ -413,6 +423,349 @@ def align_extracted_chapters(
     )
 
 
+def _realign_suspect_windows(
+    alignment: AlignmentResult,
+    *,
+    src_segments: list[Segment],
+    tgt_segments: list[Segment],
+    source_lang: str,
+    target_lang: str,
+    aligner: BaseAligner,
+) -> AlignmentResult:
+    if len(alignment.pairs) < 6:
+        return alignment
+
+    src_lookup = {id(segment): idx for idx, segment in enumerate(src_segments)}
+    tgt_lookup = {id(segment): idx for idx, segment in enumerate(tgt_segments)}
+    local_aligner = _build_local_realign_aligner(
+        aligner,
+        source_lang=source_lang,
+        target_lang=target_lang,
+    )
+    pairs = list(alignment.pairs)
+    for _ in range(4):
+        pair_ranges = _merge_pair_ranges(_detect_suspect_pair_ranges(pairs))
+        if not pair_ranges:
+            break
+        suspect_start, suspect_end = pair_ranges[0]
+        segment_window = _expand_pair_range_to_segment_window(
+            pairs,
+            suspect_start=suspect_start,
+            suspect_end=suspect_end,
+            src_lookup=src_lookup,
+            tgt_lookup=tgt_lookup,
+            src_total=len(src_segments),
+            tgt_total=len(tgt_segments),
+        )
+        if segment_window is None:
+            continue
+        src_start, src_end, tgt_start, tgt_end = segment_window
+        replace_start, replace_end = _pair_index_span_for_segment_window(
+            pairs,
+            src_lookup=src_lookup,
+            tgt_lookup=tgt_lookup,
+            src_start=src_start,
+            src_end=src_end,
+            tgt_start=tgt_start,
+            tgt_end=tgt_end,
+        )
+        if replace_start is None or replace_end is None:
+            continue
+
+        original_window = pairs[replace_start : replace_end + 1]
+        candidate = align_segments(
+            src_segments[src_start : src_end + 1],
+            tgt_segments[tgt_start : tgt_end + 1],
+            source_lang=source_lang,
+            target_lang=target_lang,
+            granularity='sentence',
+            aligner=local_aligner,
+        ).pairs
+        if not candidate:
+            continue
+        if not _should_accept_realign_candidate(original_window, candidate):
+            break
+        pairs[replace_start : replace_end + 1] = candidate
+        pairs = _rerun_suffix_after_window(
+            pairs,
+            replace_end=replace_end,
+            src_segments=src_segments,
+            tgt_segments=tgt_segments,
+            src_lookup=src_lookup,
+            tgt_lookup=tgt_lookup,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            aligner=aligner,
+        )
+
+    return AlignmentResult(
+        pairs=pairs,
+        source_lang=alignment.source_lang,
+        target_lang=alignment.target_lang,
+        granularity=alignment.granularity,
+        extract_mode=alignment.extract_mode,
+        retained_source_segments=alignment.retained_source_segments,
+        retained_target_segments=alignment.retained_target_segments,
+    )
+
+
+def _build_local_realign_aligner(
+    aligner: BaseAligner,
+    *,
+    source_lang: str,
+    target_lang: str,
+) -> BaseAligner:
+    if isinstance(aligner, BertalignAdapter):
+        return BertalignAdapter(
+            model_name=aligner.model_name,
+            max_align=min(2, aligner.max_align),
+            top_k=min(2, aligner.top_k),
+            win=max(2, min(aligner.win, 3)),
+            skip=min(aligner.skip, -0.8),
+            margin=aligner.margin,
+            len_penalty=aligner.len_penalty,
+            src_lang=source_lang,
+            tgt_lang=target_lang,
+            default_score=aligner.default_score,
+        )
+    return aligner
+
+
+def _rerun_suffix_after_window(
+    pairs: list,
+    *,
+    replace_end: int,
+    src_segments: list[Segment],
+    tgt_segments: list[Segment],
+    src_lookup: dict[int, int],
+    tgt_lookup: dict[int, int],
+    source_lang: str,
+    target_lang: str,
+    aligner: BaseAligner,
+) -> list:
+    consumed_src = [
+        src_lookup[id(segment)]
+        for pair in pairs[: replace_end + 1]
+        for segment in pair.source
+        if id(segment) in src_lookup
+    ]
+    consumed_tgt = [
+        tgt_lookup[id(segment)]
+        for pair in pairs[: replace_end + 1]
+        for segment in pair.target
+        if id(segment) in tgt_lookup
+    ]
+    if not consumed_src or not consumed_tgt:
+        return pairs
+
+    next_src = max(consumed_src) + 1
+    next_tgt = max(consumed_tgt) + 1
+    if next_src >= len(src_segments) or next_tgt >= len(tgt_segments):
+        return pairs
+
+    original_suffix = pairs[replace_end + 1 :]
+    candidate_suffix = align_segments(
+        src_segments[next_src:],
+        tgt_segments[next_tgt:],
+        source_lang=source_lang,
+        target_lang=target_lang,
+        granularity='sentence',
+        aligner=aligner,
+    ).pairs
+    if not candidate_suffix:
+        return pairs
+    if original_suffix:
+        original_prefix = original_suffix[:12]
+        candidate_prefix = candidate_suffix[:12]
+        if candidate_prefix and not _should_accept_realign_candidate(original_prefix, candidate_prefix):
+            return pairs
+    if original_suffix and not _should_accept_realign_candidate(original_suffix, candidate_suffix):
+        return pairs
+    return [*pairs[: replace_end + 1], *candidate_suffix]
+
+
+def _detect_suspect_pair_ranges(pairs: list) -> list[tuple[int, int]]:
+    total = len(pairs)
+    if total < 6:
+        return []
+
+    window_size = min(8, max(6, total))
+    lookback_size = min(6, max(3, total // 8))
+    boundary = 60 if total > 160 else max(0, total // 8)
+    flagged: list[tuple[int, int]] = []
+
+    for start in range(0, total - window_size + 1):
+        end = start + window_size - 1
+        if boundary and (end < boundary or start >= total - boundary):
+            continue
+        window = pairs[start : end + 1]
+        lookback_start = max(0, start - lookback_size)
+        lookback = pairs[lookback_start:start]
+        if lookback and _one_to_one_ratio(lookback) < 0.6:
+            continue
+        big = sum(1 for pair in window if _is_big_bead(pair))
+        skip = sum(1 for pair in window if _is_skip_pair(pair))
+        extreme = sum(1 for pair in window if _has_extreme_length_ratio(pair))
+        if (
+            (big >= 3 and skip >= 1)
+            or big >= 4
+            or ((big + skip) >= 3 and extreme >= 2)
+        ):
+            flagged.append((start, end))
+    return flagged
+
+
+def _merge_pair_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if not merged or start > merged[-1][1] + 1:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _expand_pair_range_to_segment_window(
+    pairs: list,
+    *,
+    suspect_start: int,
+    suspect_end: int,
+    src_lookup: dict[int, int],
+    tgt_lookup: dict[int, int],
+    src_total: int,
+    tgt_total: int,
+) -> tuple[int, int, int, int] | None:
+    src_indices = [
+        src_lookup[id(segment)]
+        for pair in pairs[suspect_start : suspect_end + 1]
+        for segment in pair.source
+        if id(segment) in src_lookup
+    ]
+    tgt_indices = [
+        tgt_lookup[id(segment)]
+        for pair in pairs[suspect_start : suspect_end + 1]
+        for segment in pair.target
+        if id(segment) in tgt_lookup
+    ]
+    if not src_indices or not tgt_indices:
+        return None
+    context = 10
+    return (
+        max(0, min(src_indices) - context),
+        min(src_total - 1, max(src_indices) + context),
+        max(0, min(tgt_indices) - context),
+        min(tgt_total - 1, max(tgt_indices) + context),
+    )
+
+
+def _pair_index_span_for_segment_window(
+    pairs: list,
+    *,
+    src_lookup: dict[int, int],
+    tgt_lookup: dict[int, int],
+    src_start: int,
+    src_end: int,
+    tgt_start: int,
+    tgt_end: int,
+) -> tuple[int | None, int | None]:
+    matching_indices = [
+        idx
+        for idx, pair in enumerate(pairs)
+        if _pair_overlaps_segment_window(
+            pair,
+            src_lookup=src_lookup,
+            tgt_lookup=tgt_lookup,
+            src_start=src_start,
+            src_end=src_end,
+            tgt_start=tgt_start,
+            tgt_end=tgt_end,
+        )
+    ]
+    if not matching_indices:
+        return None, None
+    return matching_indices[0], matching_indices[-1]
+
+
+def _pair_overlaps_segment_window(
+    pair,
+    *,
+    src_lookup: dict[int, int],
+    tgt_lookup: dict[int, int],
+    src_start: int,
+    src_end: int,
+    tgt_start: int,
+    tgt_end: int,
+) -> bool:
+    for segment in pair.source:
+        idx = src_lookup.get(id(segment))
+        if idx is not None and src_start <= idx <= src_end:
+            return True
+    for segment in pair.target:
+        idx = tgt_lookup.get(id(segment))
+        if idx is not None and tgt_start <= idx <= tgt_end:
+            return True
+    return False
+
+
+def _should_accept_realign_candidate(original_pairs: list, candidate_pairs: list) -> bool:
+    original = _window_metrics(original_pairs)
+    candidate = _window_metrics(candidate_pairs)
+    if candidate['score'] <= original['score']:
+        return False
+    if candidate['skip'] > original['skip']:
+        return False
+    if candidate['big'] > original['big']:
+        return False
+    return candidate['one_to_one'] >= original['one_to_one']
+
+
+def _window_metrics(pairs: list) -> dict[str, float]:
+    one_to_one = sum(1 for pair in pairs if len(pair.source) == 1 and len(pair.target) == 1)
+    skip = sum(1 for pair in pairs if _is_skip_pair(pair))
+    big = sum(1 for pair in pairs if _is_big_bead(pair))
+    extreme = sum(1 for pair in pairs if _has_extreme_length_ratio(pair))
+    score = one_to_one * 3.0 - skip * 2.5 - big * 2.0 - extreme * 1.0
+    return {
+        'one_to_one': one_to_one,
+        'skip': skip,
+        'big': big,
+        'extreme': extreme,
+        'score': score,
+    }
+
+
+def _one_to_one_ratio(pairs: list) -> float:
+    if not pairs:
+        return 0.0
+    one_to_one = sum(1 for pair in pairs if len(pair.source) == 1 and len(pair.target) == 1)
+    return one_to_one / len(pairs)
+
+
+def _is_skip_pair(pair) -> bool:
+    return not pair.source or not pair.target
+
+
+def _is_big_bead(pair) -> bool:
+    src_count = len(pair.source)
+    tgt_count = len(pair.target)
+    if src_count == 0 or tgt_count == 0:
+        return False
+    if (src_count, tgt_count) in {(1, 1), (1, 2), (2, 1), (2, 2)}:
+        return False
+    return src_count >= 3 or tgt_count >= 3
+
+
+def _has_extreme_length_ratio(pair) -> bool:
+    if not pair.source or not pair.target:
+        return False
+    src_len = max(1, sum(len(segment.text.strip()) for segment in pair.source))
+    tgt_len = max(1, sum(len(segment.text.strip()) for segment in pair.target))
+    ratio = max(src_len / tgt_len, tgt_len / src_len)
+    return ratio >= 3.5
+
+
 def align_books(
     source_book: epub.EpubBook,
     target_book: epub.EpubBook,
@@ -420,8 +773,9 @@ def align_books(
     source_lang: str,
     target_lang: str,
     chapter_match_mode: str | None = None,
-    extract_mode: str = 'filtered',
+    extract_mode: str = 'filtered_preserve',
     aligner: BaseAligner | None = None,
+    enable_local_realign: bool = False,
 ) -> AlignmentResult:
     """Extract and align two books chapter by chapter."""
 
@@ -437,6 +791,7 @@ def align_books(
         target_lang=target_lang,
         chapter_match_mode=resolved_match_mode,
         aligner=aligner,
+        enable_local_realign=enable_local_realign,
     )
     result.extract_mode = extract_mode
     result.retained_source_segments = [
@@ -453,9 +808,11 @@ def align_books(
 
 
 def _resolve_chapter_match_mode(chapter_match_mode: str | None, *, extract_mode: str) -> str:
+    if extract_mode != 'filtered_preserve':
+        raise ValueError(f'Unsupported extract_mode: {extract_mode}')
     if chapter_match_mode is not None:
         return chapter_match_mode
-    return 'raw' if extract_mode == 'full_text' else 'structured'
+    return 'structured'
 
 
 def run_bilingual_epub_pipeline(
@@ -467,7 +824,7 @@ def run_bilingual_epub_pipeline(
     target_lang: str = 'zh',
     builder_mode: str = 'simple',
     chapter_match_mode: str | None = None,
-    extract_mode: str = 'filtered',
+    extract_mode: str = 'filtered_preserve',
     alignment_json_input_path: str | Path | None = None,
     alignment_json_output_path: str | Path | None = None,
     writeback_mode: str = 'paragraph',
@@ -475,6 +832,7 @@ def run_bilingual_epub_pipeline(
     emit_translation_metadata: bool = False,
     normalize_vertical_punctuation: bool = True,
     aligner: BaseAligner | None = None,
+    enable_local_realign: bool = False,
 ) -> AlignmentResult:
     """Run the end-to-end pipeline and write a bilingual EPUB."""
 
@@ -497,6 +855,7 @@ def run_bilingual_epub_pipeline(
             chapter_match_mode=chapter_match_mode,
             extract_mode=extract_mode,
             aligner=aligner,
+            enable_local_realign=enable_local_realign,
         )
         if alignment_json_output_path is not None:
             save_alignment_result(alignment, alignment_json_output_path)
@@ -527,7 +886,7 @@ def build_bilingual_epub_from_alignment(
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
     normalize_vertical_punctuation: bool = True,
-    extract_mode: str = 'filtered',
+    extract_mode: str = 'filtered_preserve',
 ) -> None:
     if builder_mode == 'simple':
         build_bilingual_epub(
@@ -564,7 +923,7 @@ def build_bilingual_epub_from_alignment_json(
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
     normalize_vertical_punctuation: bool = True,
-    extract_mode: str = 'filtered',
+    extract_mode: str = 'filtered_preserve',
 ) -> AlignmentResult:
     source_book = read_epub(source_epub_path)
     target_book = read_epub(target_epub_path)

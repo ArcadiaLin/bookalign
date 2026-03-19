@@ -49,6 +49,25 @@ class StubAligner:
         return [([idx], [idx], 1.0) for idx in range(min(len(src_texts), len(tgt_texts)))]
 
 
+class LocalRealignStubAligner:
+    def __init__(self):
+        self.calls = []
+
+    def align(self, src_texts, tgt_texts):
+        self.calls.append((src_texts, tgt_texts))
+        if len(self.calls) == 1:
+            return [
+                ([0], [0], 1.0),
+                ([1], [1], 1.0),
+                ([2], [2], 1.0),
+                ([3, 4, 5, 6], [3], 1.0),
+                ([7], [], 1.0),
+                ([8, 9, 10, 11], [4], 1.0),
+                ([], [5, 6, 7, 8, 9, 10, 11], 1.0),
+            ]
+        return [([idx], [idx], 1.0) for idx in range(min(len(src_texts), len(tgt_texts)))]
+
+
 def test_align_books_extracts_and_aligns_chapters_in_order():
     source_book = _book(
         'Source',
@@ -155,7 +174,7 @@ def test_match_extracted_chapters_raw_mode_keeps_paratext_candidates():
     assert [match.target_chapter.spine_idx for match in matches] == [0, 1, 2, 3]
 
 
-def test_extract_sentence_chapters_full_text_keeps_toc_and_notes():
+def test_extract_sentence_chapters_filtered_preserve_keeps_toc_and_notes():
     book = _book(
         'Target',
         'zh',
@@ -169,12 +188,10 @@ def test_extract_sentence_chapters_full_text_keeps_toc_and_notes():
         ],
     )
 
-    filtered = extract_sentence_chapters(book, language='zh', extract_mode='filtered')
-    full_text = extract_sentence_chapters(book, language='zh', extract_mode='full_text')
+    chapters = extract_sentence_chapters(book, language='zh', extract_mode='filtered_preserve')
 
-    assert len(filtered) == 1
-    assert [segment.text for segment in filtered[0].segments] == ['正文。']
-    assert [segment.text for segment in full_text[0].segments][:3] == ['第一章', '正文1。', '注释正文。']
+    assert len(chapters) == 1
+    assert [segment.text for segment in chapters[0].segments][:3] == ['第一章', '正文1。', '注释正文。']
 
 
 def test_extract_sentence_chapters_filtered_preserve_splits_alignment_and_retained_segments():
@@ -199,25 +216,21 @@ def test_extract_sentence_chapters_filtered_preserve_splits_alignment_and_retain
     assert [segment.text for segment in chapters[0].retained_segments] == ['第一章', '注释正文。']
 
 
-def test_align_books_full_text_defaults_to_raw_chapter_matching():
+def test_align_books_filtered_preserve_defaults_to_structured_chapter_matching():
     source_book = _book(
         'Source',
         'ja',
         [
-            (
-                '目次',
-                '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav><p>甲。</p>',
-            ),
+            ('目次', '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav>'),
+            ('第一章', '<p>甲。</p>'),
         ],
     )
     target_book = _book(
         'Target',
         'zh',
         [
-            (
-                '目录',
-                '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav><p>乙。</p>',
-            ),
+            ('目录', '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav>'),
+            ('第一章', '<p>乙。</p>'),
         ],
     )
     aligner = StubAligner()
@@ -227,13 +240,12 @@ def test_align_books_full_text_defaults_to_raw_chapter_matching():
         target_book,
         source_lang='ja',
         target_lang='zh',
-        extract_mode='full_text',
+        extract_mode='filtered_preserve',
         aligner=aligner,
     )
 
     assert len(aligner.calls) == 1
-    assert aligner.calls[0][0][0] == '第一章'
-    assert aligner.calls[0][1][0] == '第一章'
+    assert aligner.calls[0] == (['甲。'], ['乙。'])
     assert result.pairs
 
 
@@ -312,6 +324,34 @@ def test_align_books_uses_chapter_matching_before_sentence_alignment():
     assert aligner.calls[0] == (['甲。', '乙。'], ['あ。', 'い。'])
     assert aligner.calls[1] == (['丙。'], ['う。'])
     assert len(result.pairs) == 3
+
+
+def test_align_books_can_locally_realign_suspect_windows():
+    source_book = _book(
+        'Source',
+        'ja',
+        [('第一章', _paragraphs(12, '原'))],
+    )
+    target_book = _book(
+        'Target',
+        'zh',
+        [('第一章', _paragraphs(12, '译'))],
+    )
+    aligner = LocalRealignStubAligner()
+
+    result = align_books(
+        source_book,
+        target_book,
+        source_lang='ja',
+        target_lang='zh',
+        extract_mode='filtered_preserve',
+        aligner=aligner,
+        enable_local_realign=True,
+    )
+
+    assert len(aligner.calls) >= 2
+    assert all(len(pair.source) == 1 and len(pair.target) == 1 for pair in result.pairs)
+    assert len(result.pairs) >= 11
 
 
 def test_run_bilingual_epub_pipeline_can_save_alignment_json(tmp_path: Path):
@@ -446,7 +486,7 @@ def test_run_bilingual_epub_pipeline_with_real_kinkaku_books_uses_matched_body_c
 
     assert output_path.exists()
     assert len(aligner.calls) == 10
-    assert aligner.calls[0][0][0] == '幼時から父は、私によく、金閣のことを語った。'
+    assert aligner.calls[0][0][0] == '幼時から父は、私によく、金閣＊一のことを語った。'
     assert aligner.calls[0][1][0] == '打小时候起，父亲就常常跟我讲金阁的故事。'
     assert result.pairs
 
@@ -454,5 +494,5 @@ def test_run_bilingual_epub_pipeline_with_real_kinkaku_books_uses_matched_body_c
     docs = get_spine_documents(built)
     assert len(docs) == 10
     first_doc_html = docs[0][1].get_content().decode('utf-8')
-    assert '幼時から父は、私によく、金閣のことを語った。' in first_doc_html
+    assert '幼時から父は、私によく、金閣＊一のことを語った。' in first_doc_html
     assert '打小时候起，父亲就常常跟我讲金阁的故事。' in first_doc_html
