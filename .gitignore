@@ -12,8 +12,16 @@ __pycache__/
 
 # Local test inputs / downloaded models
 *.epub
+test.py
+batch_test.py
+scripts/run_window_realign_batch.py
 
 # Generated test artifacts
 tests/artifacts/*
 !tests/artifacts/batch_reader_reports/
 !tests/artifacts/batch_reader_reports/**
+!examples/
+!examples/README.md
+!docs/
+!docs/images/
+!docs/images/.gitkeep

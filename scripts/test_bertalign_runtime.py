@@ -27,6 +27,11 @@ def _parse_args() -> argparse.Namespace:
         default='sentence-transformers/LaBSE',
         help='SentenceTransformer model id or local path.',
     )
+    parser.add_argument(
+        '--device',
+        default='cuda',
+        help='Embedding device to request for Bertalign (for example: cuda, cuda:0, cpu, auto).',
+    )
     return parser.parse_args()
 
 
@@ -39,6 +44,7 @@ def main() -> int:
         print(f'cuda_device={torch.cuda.get_device_name(0)}')
     print(f'faiss_version={faiss.__version__}')
     print(f'model_name={args.model_name}')
+    print(f'requested_device={args.device}')
 
     source = [
         _segment('两年以后，大兴安岭。', 0),
@@ -61,6 +67,7 @@ def main() -> int:
         target_lang='en',
         granularity='sentence',
         model_name=args.model_name,
+        device=args.device,
     )
 
     print(f'pair_count={len(result.pairs)}')

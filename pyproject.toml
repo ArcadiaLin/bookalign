@@ -1,7 +1,7 @@
 [project]
 name = "bookalign"
 version = "0.1.0"
-description = "Sentence-level EPUB extraction, bilingual alignment, and EPUB rebuilding."
+description = "Align an original EPUB and its translation into a bilingual EPUB for parallel reading."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

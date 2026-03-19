@@ -41,6 +41,7 @@ class BertalignAdapter(BaseAligner):
         self,
         *,
         model_name: str = 'sentence-transformers/LaBSE',
+        device: str = 'cuda',
         max_align: int = 5,
         top_k: int = 3,
         win: int = 5,
@@ -52,6 +53,7 @@ class BertalignAdapter(BaseAligner):
         default_score: float = 1.0,
     ) -> None:
         self.model_name = model_name
+        self.device = device
         self.max_align = max_align
         self.top_k = top_k
         self.win = win
@@ -73,7 +75,7 @@ class BertalignAdapter(BaseAligner):
 
         try:
             vendor = _load_vendor_module()
-            vendor.configure_model(self.model_name)
+            vendor.configure_model(self.model_name, self.device)
             vendor_aligner = vendor.Bertalign(
                 '\n'.join(src_texts),
                 '\n'.join(tgt_texts),

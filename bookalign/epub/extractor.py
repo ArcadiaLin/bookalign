@@ -33,7 +33,10 @@ _DIALOGUE_TAG_RE = re.compile(
     r')\b',
     re.IGNORECASE,
 )
-_NOTE_ID_RE = re.compile(r'(?:^|[-_])(fn|note|footnote|endnote|backlink|注)(?:[-_0-9].*)?$', re.IGNORECASE)
+_NOTE_ID_RE = re.compile(
+    r'(?:^|[-_])(?:fnref|noteref|footnote-ref|footnote|endnote|note|fn|backlink|backref|注)(?:[-_0-9].*)?$',
+    re.IGNORECASE,
+)
 _NOTE_HREF_RE = re.compile(r'#(?:fn|note|footnote|endnote|注)', re.IGNORECASE)
 
 

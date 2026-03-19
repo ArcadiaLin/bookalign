@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from pathlib import Path
 import re
@@ -385,6 +385,7 @@ def align_extracted_chapters(
         target_chapters,
         chapter_match_mode=chapter_match_mode,
     )
+    matched_target_spine_idxs = {match.target_chapter.spine_idx for match in chapter_matches}
     for chapter_match in chapter_matches:
         chapter_result = align_segments(
             chapter_match.source_chapter.alignment_segments,
@@ -417,8 +418,17 @@ def align_extracted_chapters(
         ],
         retained_target_segments=[
             segment
-            for chapter in target_chapters
-            for segment in chapter.retained_segments
+            for segment in _merge_retained_segments(
+                [
+                    segment
+                    for chapter in target_chapters
+                    for segment in chapter.retained_segments
+                ],
+                _collect_unmatched_target_alignment_segments(
+                    target_chapters,
+                    matched_target_spine_idxs=matched_target_spine_idxs,
+                ),
+            )
         ],
     )
 
@@ -518,6 +528,7 @@ def _build_local_realign_aligner(
     if isinstance(aligner, BertalignAdapter):
         return BertalignAdapter(
             model_name=aligner.model_name,
+            device=aligner.device,
             max_align=min(2, aligner.max_align),
             top_k=min(2, aligner.top_k),
             win=max(2, min(aligner.win, 3)),
@@ -799,12 +810,54 @@ def align_books(
         for chapter in source_chapters
         for segment in chapter.retained_segments
     ]
-    result.retained_target_segments = [
-        segment
-        for chapter in target_chapters
-        for segment in chapter.retained_segments
-    ]
+    result.retained_target_segments = _merge_retained_segments(
+        [
+            segment
+            for chapter in target_chapters
+            for segment in chapter.retained_segments
+        ],
+        result.retained_target_segments,
+    )
     return result
+
+
+def _collect_unmatched_target_alignment_segments(
+    target_chapters: list[ExtractedChapter],
+    *,
+    matched_target_spine_idxs: set[int],
+) -> list[Segment]:
+    retained: list[Segment] = []
+    for chapter in target_chapters:
+        if chapter.spine_idx in matched_target_spine_idxs:
+            continue
+        for segment in chapter.alignment_segments:
+            retained.append(
+                replace(
+                    segment,
+                    alignment_role='retain',
+                    filter_reason=segment.filter_reason or 'unmatched_target_chapter',
+                )
+            )
+    return retained
+
+
+def _merge_retained_segments(*groups: list[Segment]) -> list[Segment]:
+    merged: list[Segment] = []
+    seen: set[tuple[int, int, int | None, str, str]] = set()
+    for group in groups:
+        for segment in group:
+            key = (
+                segment.chapter_idx,
+                segment.paragraph_idx,
+                segment.sentence_idx,
+                segment.paragraph_cfi or segment.cfi,
+                segment.raw_html or segment.text,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(segment)
+    return merged
 
 
 def _resolve_chapter_match_mode(chapter_match_mode: str | None, *, extract_mode: str) -> str:

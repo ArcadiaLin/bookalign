@@ -79,6 +79,7 @@ _VERTICAL_TO_HORIZONTAL_PUNCTUATION = str.maketrans({
     '﹃': '『',
     '﹄': '』',
 })
+_NOTE_REF_ANCHOR_RE = re.compile(r'^fnref\d+$', re.IGNORECASE)
 
 
 @dataclass
@@ -103,7 +104,8 @@ class SourceLayoutBuilderConfig:
     note_anchor_map: dict[str, str] = field(default_factory=dict)
     note_ref_anchor_map: dict[str, str] = field(default_factory=dict)
     note_ref_doc_map: dict[str, str] = field(default_factory=dict)
-    retained_doc_name: str = 'xhtml/bookalign-retained-target.xhtml'
+    retained_doc_name: str = 'xhtml/bookalign-note-target.xhtml'
+    retained_extra_doc_name: str = 'xhtml/bookalign-retained-extra.xhtml'
 
 
 @dataclass
@@ -128,6 +130,28 @@ class _TextSlotKey:
     owner_path: tuple[int, ...]
     source_kind: str
     text_node_index: int
+
+
+def _toc_entries(toc) -> tuple:
+    if toc is None:
+        return ()
+    if isinstance(toc, (list, tuple)):
+        return tuple(toc)
+    return (toc,)
+
+
+def _clean_toc_entries(entries) -> tuple:
+    cleaned = []
+    for entry in _toc_entries(entries):
+        if isinstance(entry, tuple) and len(entry) == 2:
+            section, children = entry
+            cleaned_children = _clean_toc_entries(children)
+            cleaned.append((section, cleaned_children))
+            continue
+        href = getattr(entry, 'href', '') or ''
+        if href:
+            cleaned.append(entry)
+    return tuple(cleaned)
 
 
 def _source_layout_css(layout_direction: str) -> str:
@@ -174,6 +198,15 @@ body rt {
   line-height: 1.8;
   text-align: left;
   text-indent: 0;
+}}
+.bookalign-note-ref-marker {{
+  display: inline-block;
+  margin-left: 0.08em;
+  font-size: 0.72em;
+  line-height: 1;
+  vertical-align: super;
+  font-weight: 600;
+  text-decoration: none !important;
 }}
 """
 
@@ -303,7 +336,7 @@ def build_bilingual_epub_on_source_layout(
     )
     if extract_mode != 'filtered_preserve':
         raise ValueError(f'Unsupported extract_mode: {extract_mode}')
-    _append_retained_target_document(
+    _append_retained_target_documents(
         alignment=alignment,
         source_book=source_book,
         config=config,
@@ -527,10 +560,16 @@ def _append_unmatched_note_segments(
     _set_document_content(doc, root)
 
 
-def _collect_retained_target_blocks(alignment: AlignmentResult) -> list[Segment]:
+def _collect_retained_target_blocks(
+    alignment: AlignmentResult,
+    *,
+    include_notes: bool,
+) -> list[Segment]:
     retained: list[Segment] = []
     seen: set[tuple[int, int, str, str]] = set()
     for segment in alignment.retained_target_segments:
+        if _is_note_segment(segment) != include_notes:
+            continue
         key = (
             segment.chapter_idx,
             segment.paragraph_idx,
@@ -541,7 +580,27 @@ def _collect_retained_target_blocks(alignment: AlignmentResult) -> list[Segment]
             continue
         seen.add(key)
         retained.append(segment)
+    for pair in alignment.pairs:
+        if pair.source:
+            continue
+        for segment in pair.target:
+            if _is_note_segment(segment) != include_notes:
+                continue
+            key = (
+                segment.chapter_idx,
+                segment.paragraph_idx,
+                segment.paragraph_cfi or segment.cfi,
+                segment.raw_html or segment.text,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            retained.append(segment)
     return retained
+
+
+def _is_note_segment(segment: Segment) -> bool:
+    return segment.is_note_like or segment.paratext_kind == 'note_body'
 
 
 def _retained_section_title(paratext_kind: str) -> str:
@@ -555,26 +614,52 @@ def _retained_section_title(paratext_kind: str) -> str:
     }.get(paratext_kind, '其他保留内容')
 
 
-def _append_retained_target_document(
+def _append_retained_target_documents(
     *,
     alignment: AlignmentResult,
     source_book: epub.EpubBook,
     config: SourceLayoutBuilderConfig,
 ) -> None:
-    retained_blocks = _collect_retained_target_blocks(alignment)
+    _append_retained_target_document(
+        alignment=alignment,
+        source_book=source_book,
+        config=config,
+        doc_name=config.retained_doc_name,
+        title='译注附录',
+        include_notes=True,
+    )
+    _append_retained_target_document(
+        alignment=alignment,
+        source_book=source_book,
+        config=config,
+        doc_name=config.retained_extra_doc_name,
+        title='未对齐译文附录',
+        include_notes=False,
+    )
+
+def _append_retained_target_document(
+    *,
+    alignment: AlignmentResult,
+    source_book: epub.EpubBook,
+    config: SourceLayoutBuilderConfig,
+    doc_name: str,
+    title: str,
+    include_notes: bool,
+) -> None:
+    retained_blocks = _collect_retained_target_blocks(alignment, include_notes=include_notes)
     if not retained_blocks:
         return
 
     appendix = epub.EpubHtml(
-        title='译文附录',
-        file_name=config.retained_doc_name,
+        title=title,
+        file_name=doc_name,
         lang=config.target_lang,
     )
     root = etree.fromstring(
         (
             '<?xml version="1.0" encoding="utf-8"?>'
-            '<html xmlns="http://www.w3.org/1999/xhtml">'
-            '<head><title>译文附录</title></head>'
+            f'<html xmlns="http://www.w3.org/1999/xhtml">'
+            f'<head><title>{html.escape(title)}</title></head>'
             '<body><div class="main"/></body>'
             '</html>'
         ).encode('utf-8'),
@@ -591,13 +676,13 @@ def _append_retained_target_document(
         body.append(main)
 
     heading = _make_xhtml_element(root, 'h1')
-    heading.text = '译文附录'
+    heading.text = title
     heading.tail = '\n'
     main.append(heading)
 
     current_section = None
     for segment in retained_blocks:
-        section_title = _retained_section_title(segment.paratext_kind)
+        section_title = '注释' if include_notes and _is_note_segment(segment) else _retained_section_title(segment.paratext_kind)
         if section_title != current_section:
             section = _make_xhtml_element(root, 'h2')
             section.text = section_title
@@ -609,6 +694,7 @@ def _append_retained_target_document(
             root=root,
             segment=segment,
             config=config,
+            current_doc_name=doc_name,
         )
         block.tail = '\n'
         main.append(block)
@@ -623,7 +709,16 @@ def _append_retained_target_document(
     )
     _attach_stylesheet_link(appendix, 'styles/bookalign-source-layout.css')
     source_book.add_item(appendix)
-    source_book.toc = tuple([*tuple(source_book.toc or ()), appendix])
+    source_book.toc = tuple(
+        [
+            *_clean_toc_entries(source_book.toc),
+            epub.Link(
+                appendix.file_name,
+                title,
+                getattr(appendix, 'id', None) or doc_name,
+            ),
+        ]
+    )
     source_book.spine = [*list(source_book.spine), appendix]
     return
 
@@ -633,8 +728,14 @@ def _render_retained_segment_block(
     root,
     segment: Segment,
     config: SourceLayoutBuilderConfig,
+    current_doc_name: str,
 ):
-    rendered = _retained_block_from_raw_html(root=root, segment=segment, config=config)
+    rendered = _retained_block_from_raw_html(
+        root=root,
+        segment=segment,
+        config=config,
+        current_doc_name=current_doc_name,
+    )
     if rendered is not None:
         return rendered
 
@@ -645,7 +746,7 @@ def _render_retained_segment_block(
             root=root,
             segments=[segment],
             config=config,
-            current_doc_name=config.retained_doc_name,
+            current_doc_name=current_doc_name,
         )
     else:
         paragraph.text = _normalize_target_text_for_layout(
@@ -661,6 +762,7 @@ def _retained_block_from_raw_html(
     root,
     segment: Segment,
     config: SourceLayoutBuilderConfig,
+    current_doc_name: str,
 ):
     raw_html = (segment.raw_html or '').strip()
     if not raw_html:
@@ -682,8 +784,14 @@ def _retained_block_from_raw_html(
     _rewrite_retained_subtree(
         block,
         config=config,
-        current_doc_name=config.retained_doc_name,
+        current_doc_name=current_doc_name,
     )
+    if _is_note_segment(segment) and not (block.get('id') or '').strip():
+        for anchor_id in _infer_note_anchor_ids(segment):
+            mapped_id = config.note_anchor_map.get(anchor_id)
+            if mapped_id:
+                block.set('id', mapped_id)
+                break
     block.tag = block.tag if isinstance(block.tag, str) else wrapper_tag
     return block
 
@@ -743,6 +851,7 @@ def _rewrite_retained_subtree(
             config=config,
             current_doc_name=current_doc_name,
         )
+    _normalize_note_ref_anchor_node(element)
 
 
 def _append_translation_text(target_texts: list[str], text: str) -> None:
@@ -761,55 +870,167 @@ def _join_translation_texts(target_texts: list[str], target_lang: str) -> str:
 
 
 def _build_note_anchor_map(alignment: AlignmentResult) -> dict[str, str]:
-    referenced_note_ids = {
-        fragment.href[1:]
-        for pair in alignment.pairs
-        for segment in pair.target
-        for fragment in segment.jump_fragments
-        if fragment.kind == 'href' and fragment.href.startswith('#')
-    }
+    referenced_note_ids: set[str] = set()
+    target_segments = [
+        *(segment for pair in alignment.pairs for segment in pair.target),
+        *alignment.retained_target_segments,
+    ]
+    for segment in target_segments:
+        for fragment in segment.jump_fragments:
+            if fragment.kind != 'href' or '#' not in fragment.href:
+                continue
+            fragment_id = fragment.href.rpartition('#')[2].strip()
+            if fragment_id:
+                referenced_note_ids.add(fragment_id)
+        referenced_note_ids.update(_collect_raw_html_href_ids(segment))
     mapping: dict[str, str] = {}
     counter = 1
-    target_segments = [
+    note_segments = [
         *alignment.retained_target_segments,
         *(
             segment
             for pair in alignment.pairs
-            if not pair.source
             for segment in pair.target
-            if segment.is_note_like or segment.has_jump_markup
+            if segment.is_note_like
         ),
     ]
-    for segment in target_segments:
-        for fragment in segment.jump_fragments:
-            if fragment.kind != 'id' or not fragment.anchor_id:
+    for segment in note_segments:
+        anchor_ids = [
+            fragment.anchor_id
+            for fragment in segment.jump_fragments
+            if (
+                fragment.kind == 'id'
+                and fragment.anchor_id
+                and 'backlink' not in fragment.anchor_id.casefold()
+                and not _looks_like_note_ref_anchor_id(fragment.anchor_id)
+            )
+        ]
+        anchor_ids.extend(_infer_note_anchor_ids(segment))
+        for anchor_id in anchor_ids:
+            if anchor_id not in referenced_note_ids:
                 continue
-            if 'backlink' in fragment.anchor_id.casefold():
+            if anchor_id in mapping:
                 continue
-            if fragment.anchor_id not in referenced_note_ids:
-                continue
-            if fragment.anchor_id in mapping:
-                continue
-            mapping[fragment.anchor_id] = f'bookalign-note-{counter:04d}'
+            mapping[anchor_id] = f'bookalign-note-{counter:04d}'
             counter += 1
     return mapping
 
 
+def _collect_raw_html_href_ids(segment: Segment) -> set[str]:
+    raw_html = (segment.raw_html or '').strip()
+    if not raw_html:
+        return set()
+    try:
+        wrapper = etree.fromstring(
+            f'<wrapper>{raw_html}</wrapper>'.encode('utf-8'),
+            parser=etree.XMLParser(recover=True),
+        )
+    except etree.XMLSyntaxError:
+        return set()
+    href_ids: set[str] = set()
+    for node in wrapper.iter():
+        if _local_tag(getattr(node, 'tag', None)) != 'a':
+            continue
+        href = (node.get('href') or '').strip()
+        if '#' not in href:
+            continue
+        fragment = href.rpartition('#')[2].strip()
+        if fragment:
+            href_ids.add(fragment)
+    return href_ids
+
+
+def _infer_note_anchor_ids(segment: Segment) -> list[str]:
+    if not _is_note_segment(segment):
+        return []
+    inferred: list[str] = []
+    seen: set[str] = set()
+    for href_id in _collect_raw_html_href_ids(segment):
+        candidate = href_id
+        for suffix in ('-backlink', '_backlink', 'backlink'):
+            if candidate.casefold().endswith(suffix):
+                candidate = candidate[: -len(suffix)]
+                break
+        candidate = candidate.strip()
+        if not candidate or candidate == href_id or candidate in seen or _looks_like_note_ref_anchor_id(candidate):
+            continue
+        inferred.append(candidate)
+        seen.add(candidate)
+    return inferred
+
+
+def _looks_like_note_ref_anchor_id(anchor_id: str) -> bool:
+    normalized = (anchor_id or '').strip()
+    if not normalized:
+        return False
+    return bool(_NOTE_REF_ANCHOR_RE.match(normalized))
+
+
 def _build_note_ref_anchor_map(alignment: AlignmentResult) -> dict[str, str]:
+    referenced_note_ref_ids: set[str] = set()
+    for segment in _iter_note_like_target_segments(alignment):
+        for fragment in segment.jump_fragments:
+            if fragment.kind != 'href' or '#' not in fragment.href:
+                continue
+            fragment_id = fragment.href.rpartition('#')[2].strip()
+            if fragment_id:
+                referenced_note_ref_ids.add(fragment_id)
+        referenced_note_ref_ids.update(_collect_raw_html_href_ids(segment))
     mapping: dict[str, str] = {}
     counter = 1
+    anchor_segments = [
+        *(segment for pair in alignment.pairs for segment in pair.target),
+        *alignment.retained_target_segments,
+    ]
+    for segment in anchor_segments:
+        anchor_ids = [
+            fragment.anchor_id
+            for fragment in segment.jump_fragments
+            if fragment.kind == 'id' and fragment.anchor_id
+        ]
+        anchor_ids.extend(_collect_raw_html_element_ids(segment))
+        for anchor_id in anchor_ids:
+            if referenced_note_ref_ids and anchor_id not in referenced_note_ref_ids:
+                continue
+            if anchor_id in mapping:
+                continue
+            mapping[anchor_id] = f'bookalign-note-ref-{counter:04d}'
+            counter += 1
+    return mapping
+
+
+def _collect_raw_html_element_ids(segment: Segment) -> list[str]:
+    raw_html = (segment.raw_html or '').strip()
+    if not raw_html:
+        return []
+    try:
+        wrapper = etree.fromstring(
+            f'<wrapper>{raw_html}</wrapper>'.encode('utf-8'),
+            parser=etree.XMLParser(recover=True),
+        )
+    except etree.XMLSyntaxError:
+        return []
+    element_ids: list[str] = []
+    seen: set[str] = set()
+    for node in wrapper.iter():
+        element_id = (node.get('id') or '').strip()
+        if not element_id or element_id in seen:
+            continue
+        seen.add(element_id)
+        element_ids.append(element_id)
+    return element_ids
+
+
+def _iter_note_like_target_segments(alignment: AlignmentResult):
+    for segment in alignment.retained_target_segments:
+        if segment.is_note_like or segment.has_jump_markup:
+            yield segment
     for pair in alignment.pairs:
-        if not pair.source:
+        if pair.source:
             continue
         for segment in pair.target:
-            for fragment in segment.jump_fragments:
-                if fragment.kind != 'id' or not fragment.anchor_id:
-                    continue
-                if fragment.anchor_id in mapping:
-                    continue
-                mapping[fragment.anchor_id] = f'bookalign-note-ref-{counter:04d}'
-                counter += 1
-    return mapping
+            if segment.is_note_like or segment.has_jump_markup:
+                yield segment
 
 
 def _collect_unmatched_note_segments(alignment: AlignmentResult) -> list[Segment]:
@@ -847,9 +1068,12 @@ def _rewrite_note_href(
     appendix_doc_name: str = '',
 ) -> str:
     normalized = (href or '').strip()
-    if not normalized.startswith('#'):
+    if '#' not in normalized:
         return normalized
-    anchor_id = normalized[1:]
+    _, _, fragment = normalized.rpartition('#')
+    anchor_id = fragment.strip()
+    if not anchor_id:
+        return normalized
     mapped = note_anchor_map.get(anchor_id)
     if mapped:
         if appendix_doc_name and current_doc_name and current_doc_name != appendix_doc_name:
@@ -865,6 +1089,174 @@ def _rewrite_note_href(
     if current_doc_name and current_doc_name != target_doc_name:
         return f'{_relative_href(current_doc_name, target_doc_name)}#{mapped_ref}'
     return f'#{mapped_ref}'
+
+
+def _normalize_note_ref_anchor_id(
+    anchor_id: str,
+    *,
+    config: SourceLayoutBuilderConfig,
+    current_doc_name: str,
+) -> str:
+    if current_doc_name and anchor_id in config.note_ref_anchor_map:
+        return _register_note_ref_anchor(
+            anchor_id=anchor_id,
+            config=config,
+            current_doc_name=current_doc_name,
+        )
+    return config.note_anchor_map.get(anchor_id, anchor_id)
+
+
+def _is_note_ref_anchor_node(element) -> bool:
+    if _local_tag(getattr(element, 'tag', None)) != 'a':
+        return False
+    href = (element.get('href') or '').strip()
+    element_id = (element.get('id') or '').strip()
+    return bool(href and '#' in href and (href.rpartition('#')[2] or element_id))
+
+
+def _anchor_visible_text(element) -> str:
+    parts: list[str] = []
+    text = ''.join(element.itertext())
+    if text:
+        parts.append(text)
+    return ''.join(parts).strip()
+
+
+def _normalize_note_ref_anchor_node(element) -> None:
+    if _local_tag(getattr(element, 'tag', None)) != 'a':
+        return
+    has_img_child = any(_local_tag(getattr(child, 'tag', None)) == 'img' for child in element.iterdescendants())
+    if not has_img_child:
+        return
+    for child in list(element):
+        element.remove(child)
+    class_names = [name for name in (element.get('class') or '').split() if name]
+    if 'bookalign-note-ref-marker' not in class_names:
+        class_names.append('bookalign-note-ref-marker')
+    if class_names:
+        element.set('class', ' '.join(class_names))
+    element.text = '注'
+
+
+def _collect_note_ref_marker_specs(
+    *,
+    segment: Segment,
+    root,
+    config: SourceLayoutBuilderConfig,
+    current_doc_name: str,
+) -> list[tuple[int, object, str]]:
+    raw_html = (segment.raw_html or '').strip()
+    if not raw_html:
+        return []
+
+    namespace = etree.QName(root.tag).namespace if isinstance(root.tag, str) else None
+    try:
+        wrapper = etree.fromstring(
+            f'<wrapper xmlns="{namespace or ""}">{raw_html}</wrapper>'.encode('utf-8'),
+            parser=etree.XMLParser(recover=True),
+        )
+    except etree.XMLSyntaxError:
+        return []
+    if wrapper is None or not len(wrapper):
+        return []
+
+    block = wrapper[0]
+    specs: list[tuple[int, object, str]] = []
+    text_len = 0
+
+    def add_text(value: str | None) -> None:
+        nonlocal text_len
+        if not value:
+            return
+        normalized = _normalize_target_text_for_layout(
+            value,
+            target_lang=config.target_lang,
+            config=config,
+        )
+        text_len += len(normalized)
+
+    def walk(node) -> None:
+        nonlocal text_len
+        add_text(node.text)
+        for child in node:
+            if _is_note_ref_anchor_node(child) and not _anchor_visible_text(child):
+                cloned = deepcopy(child)
+                cloned.tail = None
+                _rewrite_retained_subtree(
+                    cloned,
+                    config=config,
+                    current_doc_name=current_doc_name,
+                )
+                _normalize_note_ref_anchor_node(cloned)
+                mapped_id = (cloned.get('id') or '').strip()
+                specs.append((text_len, cloned, mapped_id))
+                add_text(child.tail)
+                continue
+            walk(child)
+            add_text(child.tail)
+
+    walk(block)
+    return specs
+
+
+def _collect_note_ref_fallback_nodes(
+    *,
+    segment: Segment,
+    root,
+    config: SourceLayoutBuilderConfig,
+    current_doc_name: str,
+) -> dict[str, object]:
+    raw_html = (segment.raw_html or '').strip()
+    if not raw_html:
+        return {}
+
+    namespace = etree.QName(root.tag).namespace if isinstance(root.tag, str) else None
+    try:
+        wrapper = etree.fromstring(
+            f'<wrapper xmlns="{namespace or ""}">{raw_html}</wrapper>'.encode('utf-8'),
+            parser=etree.XMLParser(recover=True),
+        )
+    except etree.XMLSyntaxError:
+        return {}
+    if wrapper is None or not len(wrapper):
+        return {}
+
+    nodes: dict[str, object] = {}
+    for element in wrapper[0].iter():
+        element_id = (element.get('id') or '').strip()
+        if not element_id or element_id not in config.note_ref_anchor_map:
+            continue
+
+        candidate = None
+        if _local_tag(getattr(element, 'tag', None)) == 'a' and (element.get('href') or '').strip():
+            candidate = deepcopy(element)
+        else:
+            for descendant in element.iter():
+                if descendant is element:
+                    continue
+                if _local_tag(getattr(descendant, 'tag', None)) != 'a':
+                    continue
+                if not (descendant.get('href') or '').strip():
+                    continue
+                candidate = deepcopy(descendant)
+                break
+        if candidate is None:
+            continue
+
+        _rewrite_retained_subtree(
+            candidate,
+            config=config,
+            current_doc_name=current_doc_name,
+        )
+        _normalize_note_ref_anchor_node(candidate)
+        mapped_id = _register_note_ref_anchor(
+            anchor_id=element_id,
+            config=config,
+            current_doc_name=current_doc_name,
+        )
+        candidate.set('id', mapped_id)
+        nodes[mapped_id] = candidate
+    return nodes
 
 
 def _register_note_ref_anchor(
@@ -911,22 +1303,28 @@ def _render_target_segment_into(
     current_doc_name: str = '',
 ) -> None:
     anchor_ids = [
-        (
-            _register_note_ref_anchor(
-                anchor_id=fragment.anchor_id,
-                config=config,
-                current_doc_name=current_doc_name,
-            )
-            if current_doc_name and fragment.anchor_id in config.note_ref_anchor_map
-            else config.note_anchor_map.get(fragment.anchor_id, fragment.anchor_id)
+        _normalize_note_ref_anchor_id(
+            fragment.anchor_id,
+            config=config,
+            current_doc_name=current_doc_name,
         )
         for fragment in segment.jump_fragments
         if fragment.kind == 'id' and fragment.anchor_id
     ]
-    for anchor_id in anchor_ids:
-        anchor = _make_xhtml_element(root, 'a')
-        anchor.set('id', anchor_id)
-        _append_piece(parent, anchor)
+    marker_specs = _collect_note_ref_marker_specs(
+        segment=segment,
+        root=root,
+        config=config,
+        current_doc_name=current_doc_name,
+    )
+    fallback_marker_nodes = _collect_note_ref_fallback_nodes(
+        segment=segment,
+        root=root,
+        config=config,
+        current_doc_name=current_doc_name,
+    )
+    consumed_anchor_ids = {anchor_id for _, _, anchor_id in marker_specs if anchor_id}
+    pending_anchor_ids = [anchor_id for anchor_id in anchor_ids if anchor_id not in consumed_anchor_ids]
 
     normalized_text = _normalize_target_text_for_layout(
         segment.text,
@@ -945,13 +1343,35 @@ def _render_target_segment_into(
         key=lambda item: (item.start or 0, item.end or 0),
     )
     cursor = 0
+    marker_specs = sorted(marker_specs, key=lambda item: item[0])
+    marker_idx = 0
+
+    def append_markers_before(limit: int) -> None:
+        nonlocal marker_idx
+        while marker_idx < len(marker_specs) and marker_specs[marker_idx][0] < limit:
+            _, marker_node, _ = marker_specs[marker_idx]
+            _append_piece(parent, deepcopy(marker_node))
+            marker_idx += 1
+
+    def append_markers_at(limit: int) -> None:
+        nonlocal marker_idx
+        while marker_idx < len(marker_specs) and marker_specs[marker_idx][0] == limit:
+            _, marker_node, _ = marker_specs[marker_idx]
+            _append_piece(parent, deepcopy(marker_node))
+            marker_idx += 1
+
     for fragment in href_fragments:
         start = max(fragment.start or 0, cursor)
         end = min(fragment.end or 0, len(normalized_text))
+        append_markers_before(start)
         if start > cursor:
             _append_piece(parent, normalized_text[cursor:start])
+            cursor = start
+        append_markers_at(start)
         if start < end:
             anchor = _make_xhtml_element(root, 'a')
+            if pending_anchor_ids:
+                anchor.set('id', pending_anchor_ids.pop(0))
             anchor.set(
                 'href',
                 _rewrite_note_href(
@@ -966,8 +1386,24 @@ def _render_target_segment_into(
             anchor.text = normalized_text[start:end]
             _append_piece(parent, anchor)
         cursor = max(cursor, end)
+    while marker_idx < len(marker_specs):
+        marker_pos, marker_node, _ = marker_specs[marker_idx]
+        marker_pos = max(0, min(marker_pos, len(normalized_text)))
+        if marker_pos > cursor:
+            _append_piece(parent, normalized_text[cursor:marker_pos])
+            cursor = marker_pos
+        _append_piece(parent, deepcopy(marker_node))
+        marker_idx += 1
     if cursor < len(normalized_text):
         _append_piece(parent, normalized_text[cursor:])
+    for anchor_id in pending_anchor_ids:
+        fallback_marker = fallback_marker_nodes.get(anchor_id)
+        if fallback_marker is not None:
+            _append_piece(parent, deepcopy(fallback_marker))
+            continue
+        anchor = _make_xhtml_element(root, 'a')
+        anchor.set('id', anchor_id)
+        _append_piece(parent, anchor)
 
 
 def _collect_inline_paragraph_rewrites(
@@ -1776,6 +2212,7 @@ def _update_source_layout_metadata(
 
 
 def _ensure_navigation_items(book: epub.EpubBook) -> None:
+    book.toc = _clean_toc_entries(book.toc)
     _ensure_toc_uids(book.toc)
     toc_titles = _toc_title_map(book.toc)
     docs = []

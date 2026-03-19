@@ -5,24 +5,25 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from bookalign.align.bertalign_adapter import BertalignAdapter
 from bookalign.pipeline import run_bilingual_epub_pipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='bookalign',
-        description='Align two EPUB books and build a sentence-level bilingual EPUB.',
+        description='Align an original EPUB and its translation, then build a bilingual EPUB for side-by-side reading.',
     )
-    parser.add_argument('source_epub', help='Source EPUB path, for example a Chinese book.')
-    parser.add_argument('target_epub', help='Target EPUB path, for example a Japanese translation.')
+    parser.add_argument('source_epub', help='Source EPUB path, usually the original-language book.')
+    parser.add_argument('target_epub', help='Target EPUB path, usually the translated book.')
     parser.add_argument('output_epub', help='Output bilingual EPUB path.')
     parser.add_argument('--source-lang', default='ja', help='Source language code. Default: ja')
     parser.add_argument('--target-lang', default='zh', help='Target language code. Default: zh')
     parser.add_argument(
         '--builder-mode',
-        default='simple',
+        default='source_layout',
         choices=('simple', 'source_layout'),
-        help='EPUB builder mode. "source_layout" writes translations back into the source EPUB structure.',
+        help='EPUB builder mode. Default "source_layout" writes translations back into the source EPUB structure.',
     )
     parser.add_argument(
         '--writeback-mode',
@@ -67,11 +68,29 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Detect suspicious alignment windows and retry them with more conservative Bertalign settings.',
     )
+    parser.add_argument(
+        '--model-name',
+        default='sentence-transformers/LaBSE',
+        help='SentenceTransformer model name or local path for Bertalign. Default: sentence-transformers/LaBSE',
+    )
+    parser.add_argument(
+        '--device',
+        default='cuda',
+        help='Torch device for Bertalign. Default: cuda',
+    )
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
+    aligner = None
+    if args.alignment_json_input is None:
+        aligner = BertalignAdapter(
+            model_name=args.model_name,
+            device=args.device,
+            src_lang=args.source_lang,
+            tgt_lang=args.target_lang,
+        )
     alignment = run_bilingual_epub_pipeline(
         source_epub_path=Path(args.source_epub),
         target_epub_path=Path(args.target_epub),
@@ -88,6 +107,7 @@ def main() -> None:
         emit_translation_metadata=args.emit_translation_metadata,
         normalize_vertical_punctuation=not args.disable_vertical_punctuation_normalization,
         enable_local_realign=args.enable_local_realign,
+        aligner=aligner,
     )
     print(f'Generated {args.output_epub} with {len(alignment.pairs)} aligned pairs.')
 

@@ -36,8 +36,9 @@ def test_bertalign_adapter_uses_split_inputs_and_explicit_languages(monkeypatch)
         Bertalign = FakeVendorAligner
 
         @staticmethod
-        def configure_model(name):
+        def configure_model(name, device):
             captured['model_name'] = name
+            captured['device'] = device
 
     monkeypatch.setattr(
         'bookalign.align.bertalign_adapter._load_vendor_module',
@@ -46,6 +47,7 @@ def test_bertalign_adapter_uses_split_inputs_and_explicit_languages(monkeypatch)
 
     adapter = BertalignAdapter(
         model_name='test-model',
+        device='cuda:0',
         src_lang='zh-Hans',
         tgt_lang='en',
         top_k=4,
@@ -60,6 +62,7 @@ def test_bertalign_adapter_uses_split_inputs_and_explicit_languages(monkeypatch)
     assert captured['kwargs']['tgt_lang'] == 'en'
     assert captured['kwargs']['top_k'] == 4
     assert captured['model_name'] == 'test-model'
+    assert captured['device'] == 'cuda:0'
     assert captured['align_called'] is True
 
 

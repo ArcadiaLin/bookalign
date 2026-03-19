@@ -289,6 +289,40 @@ def test_align_books_filtered_preserve_aligns_only_body_and_retains_paratext():
     assert result.extract_mode == 'filtered_preserve'
 
 
+def test_align_books_retains_unmatched_target_chapter_body_segments():
+    source_book = _book(
+        'Source',
+        'ja',
+        [
+            ('第一章', '<p>甲。</p>'),
+        ],
+    )
+    target_book = _book(
+        'Target',
+        'zh',
+        [
+            ('第一章', '<p>乙。</p>'),
+            ('译后记', '<p>这是译后记正文。</p><p>补充说明。</p>'),
+        ],
+    )
+    aligner = StubAligner()
+
+    result = align_books(
+        source_book,
+        target_book,
+        source_lang='ja',
+        target_lang='zh',
+        extract_mode='filtered_preserve',
+        aligner=aligner,
+    )
+
+    assert len(aligner.calls) == 1
+    assert aligner.calls[0] == (['甲。'], ['乙。'])
+    assert [segment.text for segment in result.retained_target_segments] == ['这是译后记正文。', '补充说明。']
+    assert all(segment.alignment_role == 'retain' for segment in result.retained_target_segments)
+    assert all(segment.filter_reason == 'unmatched_target_chapter' for segment in result.retained_target_segments)
+
+
 def test_align_books_uses_chapter_matching_before_sentence_alignment():
     source_book = _book(
         'Source',

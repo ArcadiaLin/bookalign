@@ -49,6 +49,7 @@ def _segment_with_jump(
     *,
     href: str = '',
     anchor_id: str = '',
+    raw_html: str = '',
     is_note_like: bool = False,
     chapter_idx: int = 0,
     paragraph_idx: int = 0,
@@ -66,6 +67,7 @@ def _segment_with_jump(
         paragraph_idx=paragraph_idx,
         sentence_idx=sentence_idx,
         paragraph_cfi='epubcfi(/6/2)',
+        raw_html=raw_html,
         has_jump_markup=bool(fragments),
         is_note_like=is_note_like,
         jump_fragments=fragments,
@@ -660,12 +662,382 @@ def test_filtered_preserve_creates_retained_appendix_and_rewrites_note_links(tmp
 
     chapter_content = docs[0][1].get_content().decode('utf-8')
     appendix_content = docs[1][1].get_content().decode('utf-8')
-    assert 'bookalign-retained-target.xhtml#bookalign-note-0001' in chapter_content
+    assert 'xhtml/bookalign-note-target.xhtml#bookalign-note-0001' in chapter_content
     assert 'id="bookalign-note-ref-0001"' in chapter_content
-    assert '译文附录' in appendix_content
+    assert 'href="xhtml/bookalign-note-target.xhtml#bookalign-note-0001"' in chapter_content
+    assert '译注附录' in appendix_content
     assert 'id="bookalign-note-0001"' in appendix_content
     assert 'href="../chapter1.xhtml#bookalign-note-ref-0001"' in appendix_content
     assert '注释（一）。' in appendix_content
+
+
+def test_filtered_preserve_splits_note_and_extra_retained_documents(tmp_path: Path):
+    source_book = _book('Japanese Source', 'ja', '第一章', '<p>甲。</p>')
+    target_book = _book(
+        'Chinese Target',
+        'zh',
+        '第一章',
+        '<p><a class="duokan-footnote" href="#fn1" id="fnref1">1</a>正文。</p>'
+        '<aside epub:type="footnote"><p id="fn1"><a href="#fnref1">1</a>注释正文。</p></aside>',
+    )
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[
+                    _segment_with_jump(
+                        '正文。',
+                        href='#fn1',
+                        anchor_id='fnref1',
+                        raw_html=(
+                            '<p>正文'
+                            '<a class="duokan-footnote" style="text-decoration: none!important" '
+                            'href="../Text/chapter01.xhtml#fn1" id="fnref1">'
+                            '<img alt="" src="../Images/note.png"/></a>。</p>'
+                        ),
+                        paragraph_idx=0,
+                        sentence_idx=0,
+                    )
+                ],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+        extract_mode='filtered_preserve',
+        retained_target_segments=[
+            Segment(
+                text='1注释正文。',
+                cfi='epubcfi(/6/4)',
+                chapter_idx=0,
+                paragraph_idx=1,
+                sentence_idx=0,
+                paragraph_cfi='epubcfi(/6/4)',
+                raw_html='<p id="fn1"><a href="../Text/chapter01.xhtml#fnref1">1</a>注释正文。</p>',
+                has_jump_markup=True,
+                is_note_like=True,
+                alignment_role='retain',
+                paratext_kind='note_body',
+                filter_reason='note_block',
+                jump_fragments=[
+                    JumpFragment(kind='href', text='1', start=0, end=1, href='#fnref1'),
+                    JumpFragment(kind='id', anchor_id='fn1'),
+                ],
+            ),
+            Segment(
+                text='这是译后记。',
+                cfi='epubcfi(/6/6)',
+                chapter_idx=99,
+                paragraph_idx=0,
+                sentence_idx=0,
+                paragraph_cfi='epubcfi(/6/6)',
+                raw_html='<p>这是译后记。</p>',
+                alignment_role='retain',
+                paratext_kind='backmatter',
+                filter_reason='unmatched_target_chapter',
+            ),
+        ],
+    )
+
+    output_path = tmp_path / 'aligned-filtered-preserve-split.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        extract_mode='filtered_preserve',
+    )
+
+    built = read_epub(output_path)
+    docs = get_spine_documents(built)
+    assert len(docs) == 3
+
+    chapter_content = docs[0][1].get_content().decode('utf-8')
+    note_appendix_content = docs[1][1].get_content().decode('utf-8')
+    extra_appendix_content = docs[2][1].get_content().decode('utf-8')
+    assert 'id="bookalign-note-ref-0001"' in chapter_content
+    assert 'duokan-footnote' in chapter_content
+    assert 'href="xhtml/bookalign-note-target.xhtml#bookalign-note-0001"' in chapter_content
+    assert 'bookalign-note-ref-marker' in chapter_content
+    assert '>注</a>' in chapter_content
+    assert 'note.png' not in chapter_content
+    assert '译注附录' in note_appendix_content
+    assert '注释正文。' in note_appendix_content
+    assert 'href="../chapter1.xhtml#bookalign-note-ref-0001"' in note_appendix_content
+    assert '未对齐译文附录' in extra_appendix_content
+    assert '这是译后记。' in extra_appendix_content
+    assert '这是译后记。' not in note_appendix_content
+
+
+def test_filtered_preserve_recovers_span_wrapped_note_reference(tmp_path: Path):
+    source_book = _book('Japanese Source', 'ja', '第一章', '<p>甲。</p>')
+    target_book = _book(
+        'Chinese Target',
+        'zh',
+        '第一章',
+        '<p>正文<span id="footnote-007-backlink"><a class="_idFootnoteLink" href="notes.xhtml#footnote-007">1</a></span>续文。</p>'
+        '<aside epub:type="footnote"><p id="footnote-007"><a href="#footnote-007-backlink">1</a>注释正文。</p></aside>',
+    )
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[
+                    Segment(
+                        text='正文。',
+                        cfi='epubcfi(/6/2)',
+                        chapter_idx=0,
+                        paragraph_idx=0,
+                        sentence_idx=0,
+                        paragraph_cfi='epubcfi(/6/2)',
+                        raw_html=(
+                            '<p>正文'
+                            '<span id="footnote-007-backlink">'
+                            '<a class="_idFootnoteLink" href="notes.xhtml#footnote-007">1</a>'
+                            '</span>续文。</p>'
+                        ),
+                        has_jump_markup=True,
+                        jump_fragments=[
+                            JumpFragment(kind='id', anchor_id='footnote-007-backlink'),
+                        ],
+                    )
+                ],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+        extract_mode='filtered_preserve',
+        retained_target_segments=[
+            Segment(
+                text='1注释正文。',
+                cfi='epubcfi(/6/4)',
+                chapter_idx=0,
+                paragraph_idx=1,
+                sentence_idx=0,
+                paragraph_cfi='epubcfi(/6/4)',
+                raw_html='<p id="footnote-007"><a href="#footnote-007-backlink">1</a>注释正文。</p>',
+                has_jump_markup=True,
+                is_note_like=True,
+                alignment_role='retain',
+                paratext_kind='note_body',
+                filter_reason='note_block',
+                jump_fragments=[
+                    JumpFragment(kind='href', text='1', start=0, end=1, href='#footnote-007-backlink'),
+                    JumpFragment(kind='id', anchor_id='footnote-007'),
+                ],
+            )
+        ],
+    )
+
+    output_path = tmp_path / 'aligned-filtered-preserve-span-ref.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        extract_mode='filtered_preserve',
+    )
+
+    built = read_epub(output_path)
+    docs = get_spine_documents(built)
+    chapter_content = docs[0][1].get_content().decode('utf-8')
+    note_appendix_content = docs[1][1].get_content().decode('utf-8')
+    assert '<a id="bookalign-note-ref-0001"/>' not in chapter_content
+    assert 'id="bookalign-note-ref-0001"' in chapter_content
+    assert 'href="xhtml/bookalign-note-target.xhtml#bookalign-note-0001"' in chapter_content
+    assert 'class="_idFootnoteLink"' in chapter_content
+    assert 'bookalign-note-ref-marker' not in chapter_content
+    assert 'href="../chapter1.xhtml#bookalign-note-ref-0001"' in note_appendix_content
+
+
+def test_filtered_preserve_infers_note_anchor_from_backlink_only_segment(tmp_path: Path):
+    source_book = _book('Japanese Source', 'ja', '第一章', '<p>甲。</p>')
+    target_book = _book(
+        'Chinese Target',
+        'zh',
+        '第一章',
+        '<p>正文<span id="footnote-006-backlink"><a class="_idFootnoteLink" href="notes.xhtml#footnote-006">2</a></span>续文。</p>'
+        '<div id="footnote-006" epub:type="footnote"><p><a class="_idFootnoteAnchor" href="notes.xhtml#footnote-006-backlink">2</a>国民服注释。</p></div>',
+    )
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[
+                    Segment(
+                        text='正文。',
+                        cfi='epubcfi(/6/2)',
+                        chapter_idx=0,
+                        paragraph_idx=0,
+                        sentence_idx=0,
+                        paragraph_cfi='epubcfi(/6/2)',
+                        raw_html=(
+                            '<p>正文'
+                            '<span id="footnote-006-backlink">'
+                            '<a class="_idFootnoteLink" href="notes.xhtml#footnote-006">2</a>'
+                            '</span>续文。</p>'
+                        ),
+                        has_jump_markup=True,
+                        jump_fragments=[
+                            JumpFragment(kind='href', text='2', start=2, end=3, href='notes.xhtml#footnote-006'),
+                            JumpFragment(kind='id', anchor_id='footnote-006-backlink'),
+                        ],
+                    )
+                ],
+                score=1.0,
+            ),
+            AlignedPair(
+                source=[],
+                target=[
+                    Segment(
+                        text='国民服注释。',
+                        cfi='epubcfi(/6/4)',
+                        chapter_idx=0,
+                        paragraph_idx=1,
+                        sentence_idx=0,
+                        paragraph_cfi='epubcfi(/6/4)',
+                        raw_html='<p><a class="_idFootnoteAnchor" href="notes.xhtml#footnote-006-backlink">2</a>国民服注释。</p>',
+                        has_jump_markup=True,
+                        is_note_like=True,
+                        jump_fragments=[
+                            JumpFragment(kind='href', text='2', start=0, end=1, href='notes.xhtml#footnote-006-backlink'),
+                        ],
+                    )
+                ],
+                score=0.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+        extract_mode='filtered_preserve',
+    )
+
+    output_path = tmp_path / 'aligned-filtered-preserve-infer-note-anchor.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        extract_mode='filtered_preserve',
+    )
+
+    built = read_epub(output_path)
+    docs = get_spine_documents(built)
+    chapter_content = docs[0][1].get_content().decode('utf-8')
+    note_appendix_content = docs[1][1].get_content().decode('utf-8')
+    assert 'href="xhtml/bookalign-note-target.xhtml#bookalign-note-0001"' in chapter_content
+    assert 'id="bookalign-note-ref-0001"' in chapter_content
+    assert 'id="bookalign-note-0001"' in note_appendix_content
+    assert '国民服注释。' in note_appendix_content
+    assert 'href="../chapter1.xhtml#bookalign-note-ref-0001"' in note_appendix_content
+
+
+def test_filtered_preserve_rewrites_full_path_note_links_inside_retained_blocks(tmp_path: Path):
+    source_book = _book('Japanese Source', 'ja', '第一章', '<p>甲。</p>')
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>乙。</p>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[_segment('乙。', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+        extract_mode='filtered_preserve',
+        retained_target_segments=[
+            Segment(
+                text='目录内脚注引用。',
+                cfi='epubcfi(/6/4)',
+                chapter_idx=0,
+                paragraph_idx=1,
+                sentence_idx=0,
+                paragraph_cfi='epubcfi(/6/4)',
+                raw_html=(
+                    '<p>目录内脚注'
+                    '<a class="duokan-footnote" style="text-decoration: none!important" '
+                    'href="../Text/chapter01.xhtml#fn4" id="fnref4"><img alt="" src="../Images/note.png"/></a>'
+                    '引用。</p>'
+                ),
+                has_jump_markup=True,
+                is_note_like=True,
+                alignment_role='retain',
+                paratext_kind='toc',
+                filter_reason='navigation_block',
+                jump_fragments=[JumpFragment(kind='id', anchor_id='fnref4')],
+            ),
+            Segment(
+                text='✑ 注释正文。',
+                cfi='epubcfi(/6/6)',
+                chapter_idx=0,
+                paragraph_idx=2,
+                sentence_idx=0,
+                paragraph_cfi='epubcfi(/6/6)',
+                raw_html='<li id="fn4"><a href="../Text/chapter01.xhtml#fnref4">✑</a> 注释正文。</li>',
+                has_jump_markup=True,
+                is_note_like=True,
+                alignment_role='retain',
+                paratext_kind='note_body',
+                filter_reason='note_block',
+                jump_fragments=[
+                    JumpFragment(kind='href', text='✑', start=0, end=1, href='../Text/chapter01.xhtml#fnref4'),
+                    JumpFragment(kind='id', anchor_id='fn4'),
+                ],
+            ),
+        ],
+    )
+
+    output_path = tmp_path / 'aligned-filtered-preserve-retained-full-path.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        extract_mode='filtered_preserve',
+    )
+
+    built = read_epub(output_path)
+    docs = get_spine_documents(built)
+    note_appendix_content = docs[1][1].get_content().decode('utf-8')
+    assert 'note.png' not in note_appendix_content
+    assert 'bookalign-note-ref-' in note_appendix_content
+    assert 'href="#bookalign-note-' in note_appendix_content
+    assert '../Text/chapter01.xhtml#fn4' not in note_appendix_content
+    assert '../Text/chapter01.xhtml#fnref4' not in note_appendix_content
 
 
 def test_vertical_punctuation_normalization_includes_parentheses(tmp_path: Path):

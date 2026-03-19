@@ -5,8 +5,13 @@ from sentence_transformers import SentenceTransformer
 from bertalign.utils import yield_overlaps
 
 class Encoder:
-    def __init__(self, model_name):
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    def __init__(self, model_name, device=None):
+        requested_device = (device or 'auto').strip().lower()
+        if requested_device == 'auto':
+            requested_device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if requested_device.startswith('cuda') and not torch.cuda.is_available():
+            raise RuntimeError('CUDA device was requested for Bertalign, but torch.cuda.is_available() is False.')
+        self.device = requested_device
         self.model = SentenceTransformer(model_name, device=self.device)
         self.model_name = model_name
 

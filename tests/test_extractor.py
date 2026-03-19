@@ -378,6 +378,35 @@ def test_extract_segments_filtered_preserve_marks_jump_metadata():
     assert any(fragment.kind == 'id' and fragment.anchor_id == 'note-1' for fragment in segments[1].jump_fragments)
 
 
+def test_extract_segments_filtered_preserve_keeps_fnref_style_backlinks():
+    book = epub.EpubBook()
+    book.set_identifier('jump-backlink-test')
+    book.set_title('Jump Backlink Test')
+    book.set_language('zh')
+    chapter = epub.EpubHtml(title='第一章', file_name='chapter1.xhtml', lang='zh')
+    chapter.set_content(
+        '<p>正文<a class="duokan-footnote" href="#fn1" id="fnref1">1</a>。</p>'
+        '<aside epub:type="footnote"><p id="fn1"><a href="#fnref1">1</a>注释正文。</p></aside>'
+    )
+    book.add_item(chapter)
+    book.spine = [chapter]
+    book.toc = (chapter,)
+
+    chapter_idx, doc = get_spine_documents(book)[0]
+    segments = extract_segments(
+        book,
+        doc,
+        chapter_idx=chapter_idx,
+        splitter=SentenceSplitter(language='zh'),
+        extract_mode='filtered_preserve',
+    )
+
+    assert [segment.text for segment in segments] == ['正文1。', '注释正文。']
+    assert any(fragment.kind == 'id' and fragment.anchor_id == 'fnref1' for fragment in segments[0].jump_fragments)
+    assert any(fragment.kind == 'href' and fragment.href == '#fn1' for fragment in segments[0].jump_fragments)
+    assert any(fragment.kind == 'id' and fragment.anchor_id == 'fn1' for fragment in segments[1].jump_fragments)
+
+
 def test_extract_segments_filtered_preserve_marks_retained_paratext_without_dropping_note_refs():
     book = epub.EpubBook()
     book.set_identifier('filtered-preserve-test')

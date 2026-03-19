@@ -1,52 +1,57 @@
-# BookAlign 技术说明
+# BookAlign 技术细节
 
-## 1. 总览
+本文档说明 BookAlign 当前的实现方式、已知不足，以及为什么它现在会长成一个“EPUB 对齐 + 重建”工具。
 
-BookAlign 当前正式 pipeline 只有一条：
+## 1. 整体思路
+
+BookAlign 的核心目标不是翻译，而是把两本已经存在的书：
+
+- 一本原著 EPUB
+- 一本正式译本 EPUB
+
+整理成可对照阅读的单本 EPUB。
+
+正式 pipeline 目前是：
 
 ```text
 source EPUB + target EPUB
 -> filtered_preserve extraction
 -> structured chapter matching
--> Bertalign sentence alignment
--> bilingual EPUB build
+-> Bertalign sentence / paragraph alignment
+-> source-layout EPUB rebuild
 ```
 
-这条 pipeline 的核心目标是：
+这里最重要的设计取舍是两点：
 
-- 正文尽量稳定参与对齐
-- 目录、注释、前后附文等非正文不在抽取阶段丢弃
-- builder 仍能把保留信息回写到输出书里
+1. 尽量只让正文参与对齐，降低目录、脚注、后记把全文拖偏的概率。
+2. 非正文信息不在抽取阶段丢掉，而是保留到 builder 阶段再处理。
 
-## 2. 核心数据结构
+## 2. 核心数据模型
 
-### 2.1 `Segment`
+### `Segment`
 
 定义位置：
 
 - `bookalign/models/types.py`
 
+`Segment` 是整个系统里的最小工作单元。它既是对齐输入，也是回写定位锚点。
+
 关键字段：
 
-- `text`: 当前句段文本
-- `cfi`: 句子级或段落级 range CFI
+- `text`: 当前句段或段落文本
+- `cfi`: 当前单元的 EPUB CFI
 - `paragraph_cfi`: 所属段落锚点
 - `chapter_idx / paragraph_idx / sentence_idx`: 结构位置
-- `text_start / text_end`: 句子在段落规范化文本中的范围
 - `raw_html`: 原始块级 HTML
-- `element_xpath`: 调试用 XPath
-- `has_jump_markup / is_note_like / jump_fragments`: 注释跳转与脚注元数据
-- `alignment_role`: `align | retain`
-- `paratext_kind`: `body | toc | note_body | chapter_heading | frontmatter | backmatter | metadata | unknown`
-- `filter_reason`: 启发式分类原因
+- `text_start / text_end`: 句子在段落中的字符范围
+- `has_jump_markup / jump_fragments / is_note_like`: 注释与超链接元数据
+- `alignment_role`: `align` 或 `retain`
+- `paratext_kind`: `body / toc / note_body / chapter_heading / frontmatter / backmatter / metadata / unknown`
+- `filter_reason`: 启发式判定原因
 
-职责：
+### `AlignmentResult`
 
-- 作为 Bertalign 的输入文本单元
-- 作为 builder 回写的最小定位单元
-- 作为 JSON 缓存中的稳定中间表示
-
-### 2.2 `AlignmentResult`
+`AlignmentResult` 是抽取与 builder 之间的稳定中间层。
 
 关键字段：
 
@@ -54,95 +59,53 @@ source EPUB + target EPUB
 - `source_lang / target_lang`
 - `granularity`
 - `extract_mode`
-- `retained_source_segments / retained_target_segments`
+- `retained_source_segments`
+- `retained_target_segments`
 
-`retained_*` 的作用：
+它有两个用途：
 
-- 正文不参与对齐的非正文段不会丢失
-- builder 可以在 `filtered_preserve` 下把 target retained segment 统一写入附录
+- 保存正式对齐结果
+- 作为 builder-only 调试输入，避免反复重跑模型
 
-## 3. 模块职责
+## 3. EPUB 抽取
 
-### 3.1 `bookalign/epub/reader.py`
+相关模块：
 
-职责：
+- `bookalign/epub/reader.py`
+- `bookalign/epub/tag_filters.py`
+- `bookalign/epub/extractor.py`
+- `bookalign/epub/cfi.py`
+- `bookalign/epub/sentence_splitter.py`
 
-- 读取 EPUB
-- 获取 spine 文档
+当前抽取策略是 `filtered_preserve`。
 
-常用接口：
+这套策略不会把所有可见文本一股脑塞给对齐器，而是先做粗分类：
 
-- `read_epub(path)`
-- `get_spine_documents(book)`
+- 正文：进入 `alignment_segments`
+- 目录、注释正文、章节标题、前后附文等：进入 `retained_segments`
 
-### 3.2 `bookalign/epub/tag_filters.py`
-
-职责：
-
-- 提供 `filtered_preserve` 专用的元素抽取策略
-- 决定哪些节点被保留文本、哪些节点被跳过、哪些节点只保留子文本
-
-当前只支持：
-
-- `build_tag_filter_config('filtered_preserve')`
-
-### 3.3 `bookalign/epub/extractor.py`
-
-职责：
-
-- 从单个 XHTML 文档中提取 paragraph/sentence `Segment`
-- 生成 CFI、句内偏移与 jump metadata
-- 给每个 segment 打上 `alignment_role / paratext_kind / filter_reason`
-
-公开接口：
-
-```python
-extract_segments(
-    book,
-    doc,
-    chapter_idx,
-    *,
-    config=None,
-    splitter=None,
-    extract_mode='filtered_preserve',
-) -> list[Segment]
-```
-
-当前抽取语义：
-
-- `paratext_kind == 'body'` 的 segment 标记为 `alignment_role='align'`
-- 其余命中的目录、脚注、章节标题、前后附文等标记为 `alignment_role='retain'`
-
-### 3.4 `bookalign/epub/sentence_splitter.py`
-
-职责：
-
-- 多语言分句
-- 处理 CJK 引号、繁中兼容引号、书名号、括号等细节
-
-当前已覆盖：
-
-- `ja`
-- `zh`
-- `en`
-- `es`
-
-### 3.5 `bookalign/epub/cfi.py`
-
-职责：
+抽取阶段还会做几件关键事情：
 
 - 生成段落级和句子级 CFI
-- 从 CFI 回提文本
-- 为 builder 提供稳定锚点
+- 保留原始 HTML 片段供 builder 尽量复原
+- 记录脚注引用、回跳链接和锚点信息
+- 为句子保留其在段落中的范围，方便 inline 模式重建
 
-### 3.6 `bookalign/align/*`
+## 4. 章节匹配与对齐
 
-职责：
+章节匹配在 `bookalign/pipeline.py` 里完成，默认使用 `structured` 模式。
 
-- 封装对齐后端
-- 当前正式使用 `BertalignAdapter`
+它不是简单按章节标题做字符串匹配，而是结合顺序约束和文本信号做顺序 DP，尽量避免整本书在中段发生章节错位。
 
-`BaseAligner` 输出的 bead 允许：
+正文对齐由 `bookalign/align/bertalign_adapter.py` 封装的 Bertalign 完成。
+
+当前实际使用的是：
+
+- 多语句向量模型
+- embedding 相似度
+- 动态规划对齐
+
+它支持：
 
 - `1-1`
 - `1-N`
@@ -150,216 +113,144 @@ extract_segments(
 - `N-M`
 - `1-0 / 0-1`
 
-### 3.7 `bookalign/pipeline.py`
+这比“每句检索最像的一句”要稳得多，尤其适合文学翻译里常见的拆句、并句、增补和省略。
 
-职责：
+## 5. 为什么保留 JSON
 
-- 串联抽取、章节匹配、句子对齐、builder
+对齐阶段最贵，builder 调整最频繁。
 
-关键接口：
+所以 BookAlign 把 `AlignmentResult` 单独保存成 JSON，是个有意为之的工程选择。这样做有几个直接好处：
 
-```python
-extract_sentence_chapters(book, *, language: str, extract_mode: str = 'filtered_preserve') -> list[ExtractedChapter]
-match_extracted_chapters(source_chapters, target_chapters, *, chapter_match_mode: str = 'structured') -> list[ChapterMatch]
-align_books(source_book, target_book, *, source_lang: str, target_lang: str, chapter_match_mode: str | None = None, extract_mode: str = 'filtered_preserve', aligner: BaseAligner | None = None, enable_local_realign: bool = False) -> AlignmentResult
-run_bilingual_epub_pipeline(*, source_epub_path, target_epub_path, output_path, source_lang='ja', target_lang='zh', builder_mode='simple', chapter_match_mode=None, extract_mode='filtered_preserve', alignment_json_input_path=None, alignment_json_output_path=None, writeback_mode='paragraph', layout_direction='horizontal', emit_translation_metadata=False, normalize_vertical_punctuation=True, aligner=None, enable_local_realign=False) -> AlignmentResult
-build_bilingual_epub_from_alignment_json(*, source_epub_path, target_epub_path, alignment_json_path, output_path, builder_mode='simple', writeback_mode='paragraph', layout_direction='horizontal', emit_translation_metadata=False, normalize_vertical_punctuation=True, extract_mode='filtered_preserve') -> AlignmentResult
-```
+- 改样式或 builder 逻辑时，不必重新跑模型
+- 可以专门分析错位窗口
+- 可以把“对齐问题”和“重建问题”拆开调试
+- 方便后续做局部修正、回归测试和人工审阅
 
-### 3.8 `bookalign/alignment_json.py`
+## 6. EPUB 重建
 
-职责：
+相关模块：
 
-- 把 `AlignmentResult` 保存为 JSON
-- 从 JSON 恢复 `AlignmentResult`
-- 提供 builder-only 测试入口
+- `bookalign/epub/builder.py`
+- `bookalign/pipeline.py`
 
-## 4. 当前正式 pipeline 的工作原理
+目前有两种主要输出思路：
 
-### 4.1 抽取
+- `simple`: 重新生成一本文本块式双语 EPUB
+- `source_layout`: 基于原著 EPUB 结构回写译文
 
-`extract_sentence_chapters()` 会遍历每个可读 spine 文档，并调用 `extract_segments(...)`。
+公开使用时更推荐 `source_layout`，因为阅读体验更自然。
 
-每个 `ExtractedChapter` 同时保留三份视图：
+### `paragraph` 模式
 
-- `segments`: 全部 segment
-- `alignment_segments`: 只含 `alignment_role='align'` 的正文
-- `retained_segments`: 只含 `alignment_role='retain'` 的非正文
+把译文按段落写回到原段后面。
 
-### 4.2 章节匹配
+优点：
 
-`match_extracted_chapters()` 使用顺序 DP，在 source/target 章节序列上寻找最低代价路径。
+- 更稳
+- 对 source EPUB 结构破坏更小
+- 对阅读器兼容性更好
 
-默认使用：
+缺点：
 
-- `chapter_match_mode='structured'`
+- 译文颗粒度较粗
 
-当前仍保留：
+### `inline` 模式
 
-- `chapter_match_mode='raw'`
+在原 block 内做“原句 -> 译句”交错回写。
 
-但 `raw` 只建议用于局部诊断，不再是正式 pipeline 的主轴配置。
+优点：
 
-### 4.3 句子对齐
+- 对照最紧密
+- 更适合语言学习和细读
 
-`align_books()` 会把每个 matched chapter 的 `alignment_segments` 喂给 Bertalign。
+缺点：
 
-这意味着：
+- 更依赖句内定位和段内结构
+- 更容易被脏 EPUB 样式、嵌套标签和异常换行拖坏
 
-- 正文参与对齐
-- retained segment 不参与对齐
-- retained segment 仍会保存在 `AlignmentResult` 中
+## 7. 注释与未对齐内容
 
-### 4.4 局部重对齐
+这是 EPUB builder 最麻烦的一块。
 
-如果启用 `enable_local_realign=True`，pipeline 会在章节内扫描疑似断链窗口。
+当前处理原则是：
 
-当前策略：
+- 注释正文不参与正文对齐
+- 注释与其他 retained 内容仍然保存在 JSON 里
+- builder 会把注释和非注释 retained 内容分别写入附加 XHTML
+- 正文中的注释引用会被改写成可点击的脚注标记
+- 注释页中的回跳链接会指回重建后的正文锚点
 
-1. 先用正常参数完成整章对齐
-2. 在正文区扫描异常窗口
-3. 对命中的窗口用更激进的保守参数局部重对齐
-4. 再从修复边界开始对后缀重跑一次原始参数
-5. 只有新结果更好时才替换原窗口/后缀
+此外，目标书里那些整章未匹配、但本身确实存在的正文或附文，也会进入 `retained_target_segments`，不会在 JSON 里直接丢失。
 
-这套逻辑主要是为《假面的告白》繁中的正文中段断链问题准备的。
+## 8. 当前不足
 
-## 5. Builder 设计
+### EPUB 格式健康度影响太大
 
-### 5.1 `simple`
+现实里的 EPUB 非常脏。
 
-特点：
+常见问题包括：
 
-- 新建 XHTML 页面
-- 按章节写入 source/target 句对
-- 最适合查对对齐质量
+- TOC 空链接
+- 注释 DOM 结构极不统一
+- 把一整章打碎成大量 span
+- 段落和换行混用
+- 大量与正文混杂的导读、附录、元数据
 
-### 5.2 `source_layout`
+这意味着很多工程时间花在“兼容烂格式”上，而不是对齐算法本身。
 
-特点：
+### 语言覆盖还不够宽
 
-- 保留 source 的 spine 顺序和 XHTML 文件结构
-- 保留原始 `<head>` 中的标题和样式链接
-- 通过 CFI 回到原文档做回写
+现在最稳定的是：
 
-#### `writeback_mode='paragraph'`
+- 日文原著 -> 中文译本
+- 英文原著 -> 中文译本
 
-- 按 source paragraph 聚合同段译文
-- 在原段落后插入一个译文 `<p>`
-- 结构最稳，适合作为保底路径
+西语链路已经能跑，但仍比不上前两者稳。
 
-#### `writeback_mode='inline'`
+### 文学文本天生不是规整并行语料
 
-- 保留原始 block 容器
-- 在段内按“原句 -> 译句”交错回写
-- 段内只插 `<br/>`
-- 段间插入 `<p><br/></p>`
-- builder 会重新收集 live DOM 文本轨迹，再按 `text_start/text_end` 切句
+文学译本里很常见：
 
-### 5.3 `filtered_preserve` 的附录回写
+- 拆句
+- 合句
+- 倒装
+- 解释性增译
+- 修辞替换
 
-当前 builder 会把 target retained segment 写入一个 synthetic XHTML：
+这使得“句子级”天然不是一个绝对稳定的金标准，只能尽量逼近可阅读的结果。
 
-- `xhtml/bookalign-retained-target.xhtml`
+### 现在的工具形态还不是最终形态
 
-这个附录的作用：
+把结果固化成 EPUB 是目前最现实的落地方式，但不是最理想的终局。
 
-- 承载目录、注释、前后附文等 retained 内容
-- 让正文注释引用有稳定的跳转目标
-- 让附录中的 backlink 可以指回正文里的新锚点
+更理想的形态应该是：
 
-## 6. 跳转与注释保留
+- 直接进入阅读器
+- 支持句对展开/收起
+- 支持错位窗口人工修正
+- 支持阅读过程中的即时回看与注释
 
-`jump_fragments` 保存的是 builder 重写跳转所需的最小结构化信息。
+## 9. 后续方向
 
-当前 builder 会维护两张映射：
+### 更强的局部修正
 
-- `note_anchor_map`
-  - 原 note id -> 附录中的新 note id
-- `note_ref_anchor_map`
-  - 原 note id -> 正文中的新 note ref id
+当前已经有局部窗口重对齐能力，但还可以继续做：
 
-最终效果：
+- 更稳的断链检测
+- 更保守的窗口回退策略
+- builder 前的自动异常扫描
 
-- 正文 note ref -> 跳到附录中的 note body
-- 附录 note body 的 backlink -> 跳回正文中的 note ref
+### 更好的阅读器适配
 
-## 7. 横排兼容策略
+后面值得补的方向包括：
 
-当 `layout_direction='horizontal'` 时：
+- 缩进与段间距策略
+- 注释样式统一
+- 深色模式与更多阅读器兼容性测试
+- 对图片、图注、诗歌等页面的专门处理
 
-- builder 会注入横排覆盖 CSS
-- 统一改成左对齐
-- 取消默认首行缩进
-- 输出书方向设为 `ltr`
-- 译文文本会做竖排符号到横排符号的归一化
+### 从“离线工具”走向“阅读器组件”
 
-这样做是为了避免：
+这是我认为更合理的长期方向。
 
-- 继承原日文 `rtl` 阅读方向
-- 某些阅读器分页方向倒置
-- 繁中竖排兼容标点在横排书里继续出现
-
-## 8. 当前已知问题
-
-### 8.1 《假面的告白》繁中断链
-
-当前最明确的问题是《假面的告白》繁中在正文中段仍存在少量疑似断链窗口。
-
-典型信号：
-
-- 前面先有稳定 `1-1`
-- 随后突然出现连续 `4-1/1-4`
-- 中间夹 `1-0/0-1`
-- 句长比极端失衡
-
-这类问题已经不是 builder 可以修复的，而是对齐结果层的问题。
-
-### 8.2 边界 skip 不等于坏对齐
-
-书头/书尾的连续 `0-1/1-0` 很多时候只是：
-
-- 导读
-- 版权
-- 目录
-- 译者附文
-
-这类 skip 不应直接判为断链。
-
-## 9. 推荐调用方式
-
-### 9.1 端到端
-
-```bash
-uv run bookalign SOURCE.epub TARGET.epub OUTPUT.epub \
-  --source-lang ja \
-  --target-lang zh \
-  --builder-mode source_layout \
-  --writeback-mode inline \
-  --layout-direction horizontal
-```
-
-### 9.2 先生成 JSON，再做 builder-only 回归
-
-```bash
-uv run python -m bookalign.cli SOURCE.epub TARGET.epub OUT.epub \
-  --builder-mode source_layout \
-  --writeback-mode inline \
-  --alignment-json-output alignment.json
-```
-
-```bash
-uv run python -m bookalign.cli SOURCE.epub TARGET.epub OUT.epub \
-  --builder-mode source_layout \
-  --writeback-mode inline \
-  --alignment-json-input alignment.json
-```
-
-## 10. 当前建议
-
-当前最值得继续投入的方向：
-
-1. 继续收敛《假面的告白》繁中的局部断链窗口。
-2. 继续增强 `filtered_preserve` 附录跳转在不同阅读器中的稳定性。
-3. 继续扩大 inline 回写的真实书回归。
-4. 继续把 builder 调整建立在 alignment JSON 复用上，而不是保留大量真实书产物到仓库中。
+当前工具更像一个可用原型，证明“正式译本 + 原著 + 自动对齐 + EPUB 重建”这件事是可落地的；真正的产品形态，应该是阅读器里的对照阅读能力，而不是单独导出一个 EPUB 文件。
