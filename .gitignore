@@ -11,7 +11,7 @@ __pycache__/
 .claude
 
 # Local test inputs / downloaded models
-*.epub
+books/
 test.py
 batch_test.py
 scripts/run_window_realign_batch.py

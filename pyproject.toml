@@ -26,3 +26,9 @@ align = [
     "sentence-transformers>=3.0",
     "torch>=2.2",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: integration tests that read real EPUB fixtures",
+]
