@@ -30,10 +30,12 @@ class ExtractedChapter:
     spine_idx: int
     doc: epub.EpubHtml
     segments: list[Segment]
+    alignment_segments: list[Segment]
+    retained_segments: list[Segment]
 
     @property
     def sentence_count(self) -> int:
-        return len(self.segments)
+        return len(self.alignment_segments)
 
 
 @dataclass
@@ -82,6 +84,7 @@ def extract_sentence_chapters(
     book: epub.EpubBook,
     *,
     language: str,
+    extract_mode: str = 'filtered',
 ) -> list[ExtractedChapter]:
     """Extract sentence segments from each readable spine document."""
 
@@ -93,13 +96,18 @@ def extract_sentence_chapters(
             doc,
             chapter_idx=spine_idx,
             splitter=splitter,
+            extract_mode=extract_mode,
         )
         if segments:
+            alignment_segments = [segment for segment in segments if segment.alignment_role == 'align']
+            retained_segments = [segment for segment in segments if segment.alignment_role != 'align']
             chapters.append(
                 ExtractedChapter(
                     spine_idx=spine_idx,
                     doc=doc,
                     segments=segments,
+                    alignment_segments=alignment_segments,
+                    retained_segments=retained_segments,
                 )
             )
     return chapters
@@ -302,7 +310,8 @@ def _looks_like_paratext(chapter: ExtractedChapter) -> bool:
     label = _chapter_label(chapter).casefold()
     if _PARATEXT_TITLE_RE.search(label):
         return True
-    preview = ' '.join(segment.text for segment in chapter.segments[:3]).casefold()
+    preview_segments = chapter.alignment_segments or chapter.segments
+    preview = ' '.join(segment.text for segment in preview_segments[:3]).casefold()
     if _PARATEXT_TITLE_RE.search(preview):
         return True
     return False
@@ -377,8 +386,8 @@ def align_extracted_chapters(
     )
     for chapter_match in chapter_matches:
         chapter_result = align_segments(
-            chapter_match.source_chapter.segments,
-            chapter_match.target_chapter.segments,
+            chapter_match.source_chapter.alignment_segments,
+            chapter_match.target_chapter.alignment_segments,
             source_lang=source_lang,
             target_lang=target_lang,
             granularity='sentence',
@@ -391,6 +400,16 @@ def align_extracted_chapters(
         source_lang=source_lang,
         target_lang=target_lang,
         granularity='sentence',
+        retained_source_segments=[
+            segment
+            for chapter in source_chapters
+            for segment in chapter.retained_segments
+        ],
+        retained_target_segments=[
+            segment
+            for chapter in target_chapters
+            for segment in chapter.retained_segments
+        ],
     )
 
 
@@ -400,21 +419,43 @@ def align_books(
     *,
     source_lang: str,
     target_lang: str,
-    chapter_match_mode: str = 'structured',
+    chapter_match_mode: str | None = None,
+    extract_mode: str = 'filtered',
     aligner: BaseAligner | None = None,
 ) -> AlignmentResult:
     """Extract and align two books chapter by chapter."""
 
-    source_chapters = extract_sentence_chapters(source_book, language=source_lang)
-    target_chapters = extract_sentence_chapters(target_book, language=target_lang)
-    return align_extracted_chapters(
-        source_chapters,
-        target_chapters,
+    resolved_match_mode = _resolve_chapter_match_mode(chapter_match_mode, extract_mode=extract_mode)
+    source_chapters = extract_sentence_chapters(source_book, language=source_lang, extract_mode=extract_mode)
+    target_chapters = extract_sentence_chapters(target_book, language=target_lang, extract_mode=extract_mode)
+    source_alignment_chapters = [chapter for chapter in source_chapters if chapter.alignment_segments]
+    target_alignment_chapters = [chapter for chapter in target_chapters if chapter.alignment_segments]
+    result = align_extracted_chapters(
+        source_alignment_chapters,
+        target_alignment_chapters,
         source_lang=source_lang,
         target_lang=target_lang,
-        chapter_match_mode=chapter_match_mode,
+        chapter_match_mode=resolved_match_mode,
         aligner=aligner,
     )
+    result.extract_mode = extract_mode
+    result.retained_source_segments = [
+        segment
+        for chapter in source_chapters
+        for segment in chapter.retained_segments
+    ]
+    result.retained_target_segments = [
+        segment
+        for chapter in target_chapters
+        for segment in chapter.retained_segments
+    ]
+    return result
+
+
+def _resolve_chapter_match_mode(chapter_match_mode: str | None, *, extract_mode: str) -> str:
+    if chapter_match_mode is not None:
+        return chapter_match_mode
+    return 'raw' if extract_mode == 'full_text' else 'structured'
 
 
 def run_bilingual_epub_pipeline(
@@ -425,7 +466,8 @@ def run_bilingual_epub_pipeline(
     source_lang: str = 'ja',
     target_lang: str = 'zh',
     builder_mode: str = 'simple',
-    chapter_match_mode: str = 'structured',
+    chapter_match_mode: str | None = None,
+    extract_mode: str = 'filtered',
     alignment_json_input_path: str | Path | None = None,
     alignment_json_output_path: str | Path | None = None,
     writeback_mode: str = 'paragraph',
@@ -453,6 +495,7 @@ def run_bilingual_epub_pipeline(
             source_lang=source_lang,
             target_lang=target_lang,
             chapter_match_mode=chapter_match_mode,
+            extract_mode=extract_mode,
             aligner=aligner,
         )
         if alignment_json_output_path is not None:
@@ -468,6 +511,7 @@ def run_bilingual_epub_pipeline(
         layout_direction=layout_direction,
         emit_translation_metadata=emit_translation_metadata,
         normalize_vertical_punctuation=normalize_vertical_punctuation,
+        extract_mode=extract_mode,
     )
     return alignment
 
@@ -483,6 +527,7 @@ def build_bilingual_epub_from_alignment(
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
     normalize_vertical_punctuation: bool = True,
+    extract_mode: str = 'filtered',
 ) -> None:
     if builder_mode == 'simple':
         build_bilingual_epub(
@@ -502,6 +547,7 @@ def build_bilingual_epub_from_alignment(
             layout_direction=layout_direction,
             emit_translation_metadata=emit_translation_metadata,
             normalize_vertical_punctuation=normalize_vertical_punctuation,
+            extract_mode=extract_mode,
         )
         return
     raise ValueError(f'Unsupported builder_mode: {builder_mode}')
@@ -518,6 +564,7 @@ def build_bilingual_epub_from_alignment_json(
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
     normalize_vertical_punctuation: bool = True,
+    extract_mode: str = 'filtered',
 ) -> AlignmentResult:
     source_book = read_epub(source_epub_path)
     target_book = read_epub(target_epub_path)
@@ -532,5 +579,6 @@ def build_bilingual_epub_from_alignment_json(
         layout_direction=layout_direction,
         emit_translation_metadata=emit_translation_metadata,
         normalize_vertical_punctuation=normalize_vertical_punctuation,
+        extract_mode=extract_mode,
     )
     return alignment

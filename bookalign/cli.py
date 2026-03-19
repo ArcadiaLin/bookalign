@@ -19,6 +19,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--source-lang', default='ja', help='Source language code. Default: ja')
     parser.add_argument('--target-lang', default='zh', help='Target language code. Default: zh')
     parser.add_argument(
+        '--extract-mode',
+        default='filtered',
+        choices=('filtered', 'full_text', 'filtered_preserve'),
+        help='Extractor profile. "full_text" aligns all text; "filtered_preserve" keeps filtered text for builder appendix.',
+    )
+    parser.add_argument(
         '--builder-mode',
         default='simple',
         choices=('simple', 'source_layout'),
@@ -32,9 +38,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--chapter-match-mode',
-        default='structured',
+        default=None,
         choices=('structured', 'raw'),
-        help='Chapter matching strategy. "raw" disables paratext-aware skip bias.',
+        help='Chapter matching strategy. Defaults to "structured" for filtered/filtered_preserve and "raw" for full_text.',
     )
     parser.add_argument(
         '--alignment-json-input',
@@ -73,6 +79,7 @@ def main() -> None:
         output_path=Path(args.output_epub),
         source_lang=args.source_lang,
         target_lang=args.target_lang,
+        extract_mode=args.extract_mode,
         builder_mode=args.builder_mode,
         chapter_match_mode=args.chapter_match_mode,
         alignment_json_input_path=args.alignment_json_input,

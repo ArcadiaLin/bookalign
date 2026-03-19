@@ -16,6 +16,7 @@ source EPUB + target EPUB
 
 - 基于 `Segment` 的句子级对齐
 - 基于 `CFI` 的 source-layout 回写
+- 三条 extractor 主轴：`filtered` / `full_text` / `filtered_preserve`
 - 双 builder 模式
 - 《金阁寺》日文原版 / 中文译本真实书籍验证
 
@@ -25,6 +26,7 @@ source EPUB + target EPUB
 
 - 按 spine 顺序读取正文 XHTML
 - 基于规则和策略抽取可读段落
+- 支持 `extract_mode=filtered|full_text|filtered_preserve`
 - 在段落上继续切成句子级 `Segment`
 - 为段落和句子生成可回溯的 `CFI`
 
@@ -33,6 +35,8 @@ source EPUB + target EPUB
 - `BertalignAdapter` 封装 vendored `bertalign`
 - 章节级 DP 匹配，避免原书/译本 frontmatter 直接错配
 - 支持 `structured` 和 `raw` 两种章节匹配模式
+- `full_text` 主轴默认配合 `raw` 章节匹配，允许目录/注释参与对齐
+- `filtered_preserve` 主轴默认配合 `structured`，对齐时只用正文，但会保留被过滤出的目录/注释/前后附文
 - 支持把 `AlignmentResult` 保存为 JSON，供后续 builder-only 回归复用
 
 ### 3. EPUB 构建
@@ -41,6 +45,8 @@ source EPUB + target EPUB
 - `source_layout --writeback-mode paragraph`：保留 source XHTML 结构，在原段落后写回译文
 - `source_layout --writeback-mode inline`：保留 source block 容器，在段内按“原句 -> 译句”交错回写
 - `source_layout + horizontal` 模式下，会把输出书的阅读方向改为 `ltr`，避免部分阅读器沿用原日文 `rtl` 翻页语义
+- `full_text` 主轴下，target 注释跳转与注释正文会进入对齐和回写
+- `filtered_preserve` 主轴下，target 非正文内容不会参与对齐，但会写入单独的 `译文附录` XHTML，并重写正文注释跳转
 
 ## 当前边界
 
@@ -62,7 +68,7 @@ bookalign/
 books/              # 本地测试用 EPUB
 scripts/            # 环境准备和运行时 smoke test
 tests/              # pytest
-tests/artifacts/    # 仅保留 batch_reader_reports 作为提交产物
+tests/artifacts/    # 生成目录；当前真实书结果按 extract_filtered/extract_full_text/extract_filtered_preserve 分目录
 ```
 
 ## 环境
@@ -115,9 +121,9 @@ uv run bookalign \
   tests/artifacts/kinkaku_ja_zh_source_layout.epub \
   --source-lang ja \
   --target-lang zh \
+  --extract-mode filtered \
   --builder-mode source_layout \
   --writeback-mode inline \
-  --chapter-match-mode structured \
   --layout-direction horizontal
 ```
 
@@ -142,6 +148,7 @@ uv run bookalign \
 - `simple` 和 `source_layout` 两种 builder 均可生成 EPUB
 - `source_layout` 横排输出已修复阅读方向和分页兼容性问题
 - `source_layout` 已支持 `paragraph` / `inline` 两种回写策略
+- 当前真实书结果按 `tests/artifacts/extract_filtered/`、`tests/artifacts/extract_full_text/`、`tests/artifacts/extract_filtered_preserve/` 分目录保存
 
 最新测试状态见 `STATUS.md`。
 

@@ -12,7 +12,7 @@ from bookalign.epub.builder import (
 from bookalign.epub.extractor import extract_segments
 from bookalign.epub.reader import get_spine_documents, read_epub
 from bookalign.epub.sentence_splitter import SentenceSplitter
-from bookalign.models.types import AlignedPair, AlignmentResult, Segment
+from bookalign.models.types import AlignedPair, AlignmentResult, JumpFragment, Segment
 
 
 def _book(title: str, language: str, chapter_title: str, body: str) -> epub.EpubBook:
@@ -41,6 +41,34 @@ def _segment(text: str, *, chapter_idx: int = 0, paragraph_idx: int = 0, sentenc
         paragraph_idx=paragraph_idx,
         sentence_idx=sentence_idx,
         paragraph_cfi='epubcfi(/6/2)',
+    )
+
+
+def _segment_with_jump(
+    text: str,
+    *,
+    href: str = '',
+    anchor_id: str = '',
+    is_note_like: bool = False,
+    chapter_idx: int = 0,
+    paragraph_idx: int = 0,
+    sentence_idx: int = 0,
+) -> Segment:
+    fragments = []
+    if href:
+        fragments.append(JumpFragment(kind='href', text='1', start=max(0, len(text) - 1), end=len(text), href=href))
+    if anchor_id:
+        fragments.append(JumpFragment(kind='id', anchor_id=anchor_id))
+    return Segment(
+        text=text,
+        cfi='epubcfi(/6/2)',
+        chapter_idx=chapter_idx,
+        paragraph_idx=paragraph_idx,
+        sentence_idx=sentence_idx,
+        paragraph_cfi='epubcfi(/6/2)',
+        has_jump_markup=bool(fragments),
+        is_note_like=is_note_like,
+        jump_fragments=fragments,
     )
 
 
@@ -521,3 +549,268 @@ def test_source_layout_can_disable_vertical_punctuation_normalization(tmp_path: 
 
     content = get_spine_documents(read_epub(output_path))[0][1].get_content().decode('utf-8')
     assert '︽告白︾' in content
+
+
+def test_full_text_paragraph_writeback_preserves_jump_links_and_appends_unmatched_notes(tmp_path: Path):
+    source_book = _book('Japanese Source', 'ja', '第一章', '<p>甲。</p><p>乙。</p>')
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>译文1。</p><p>注释。</p>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[_segment_with_jump('正文1', href='#note-1', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+            AlignedPair(
+                source=[],
+                target=[_segment_with_jump('注释1', anchor_id='note-1', is_note_like=True, paragraph_idx=1, sentence_idx=0)],
+                score=0.8,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+    )
+
+    output_path = tmp_path / 'aligned-full-text-paragraph.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        extract_mode='full_text',
+    )
+
+    content = get_spine_documents(read_epub(output_path))[0][1].get_content().decode('utf-8')
+    assert 'href="#bookalign-note-0001"' in content
+    assert 'id="bookalign-note-0001"' in content
+    assert '译注附录' in content
+
+
+def test_full_text_inline_writeback_preserves_jump_links(tmp_path: Path):
+    source_book = _book('Japanese Source', 'ja', '第一章', '<p>甲。</p>')
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>正文1。</p>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[_segment_with_jump('正文1', href='#note-1', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+            AlignedPair(
+                source=[],
+                target=[_segment_with_jump('注释1', anchor_id='note-1', is_note_like=True, paragraph_idx=1, sentence_idx=0)],
+                score=0.6,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+    )
+
+    output_path = tmp_path / 'aligned-full-text-inline.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        writeback_mode='inline',
+        extract_mode='full_text',
+    )
+
+    content = get_spine_documents(read_epub(output_path))[0][1].get_content().decode('utf-8')
+    assert 'href="#bookalign-note-0001"' in content
+    assert 'id="bookalign-note-0001"' in content
+
+
+def test_filtered_preserve_creates_retained_appendix_and_rewrites_note_links(tmp_path: Path):
+    source_book = _book('Japanese Source', 'ja', '第一章', '<p>甲。</p>')
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>正文1。</p><aside epub:type="footnote"><p id="note-1">注释︵一︶。</p></aside>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[_segment_with_jump('正文1', href='#note-1', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+        extract_mode='filtered_preserve',
+        retained_target_segments=[
+            Segment(
+                text='注释︵一︶。',
+                cfi='epubcfi(/6/4)',
+                chapter_idx=0,
+                paragraph_idx=1,
+                sentence_idx=0,
+                paragraph_cfi='epubcfi(/6/4)',
+                raw_html='<p id="note-1">注释︵一︶。</p>',
+                has_jump_markup=True,
+                is_note_like=True,
+                alignment_role='retain',
+                paratext_kind='note_body',
+                filter_reason='note_block',
+                jump_fragments=[JumpFragment(kind='id', anchor_id='note-1')],
+            )
+        ],
+    )
+
+    output_path = tmp_path / 'aligned-filtered-preserve.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        extract_mode='filtered_preserve',
+    )
+
+    built = read_epub(output_path)
+    docs = get_spine_documents(built)
+    assert len(docs) == 2
+
+    chapter_content = docs[0][1].get_content().decode('utf-8')
+    appendix_content = docs[1][1].get_content().decode('utf-8')
+    assert 'bookalign-retained-target.xhtml#bookalign-note-0001' in chapter_content
+    assert '译文附录' in appendix_content
+    assert 'id="bookalign-note-0001"' in appendix_content
+    assert '注释（一）。' in appendix_content
+
+
+def test_vertical_punctuation_normalization_includes_parentheses(tmp_path: Path):
+    source_book = _book('Japanese Source', 'ja', '第一章', '<p>甲。</p>')
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>乙。</p>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[_segment('︵注︶', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+    )
+
+    output_path = tmp_path / 'aligned-parentheses.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+    )
+
+    content = get_spine_documents(read_epub(output_path))[0][1].get_content().decode('utf-8')
+    assert '（注）' in content
+
+
+def test_source_layout_anchors_cross_paragraph_pair_to_last_source_sentence(tmp_path: Path):
+    source_book = _book(
+        'Japanese Source',
+        'ja',
+        '第一章',
+        '<p>前句。</p><p>后句。</p>',
+    )
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>合并译文。</p>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0], source_segments[1]],
+                target=[_segment('合并译文。', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+    )
+
+    paragraph_output = tmp_path / 'cross-paragraph-anchor-paragraph.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        paragraph_output,
+        writeback_mode='paragraph',
+    )
+    paragraph_content = get_spine_documents(read_epub(paragraph_output))[0][1].get_content().decode('utf-8')
+    assert '<p>前句。</p>' in paragraph_content
+    assert '<p>后句。</p>' in paragraph_content
+    assert paragraph_content.index('<p>后句。</p>') < paragraph_content.index('<p>合并译文。</p>')
+
+    source_book = _book(
+        'Japanese Source',
+        'ja',
+        '第一章',
+        '<p>前句。</p><p>后句。</p>',
+    )
+    target_book = _book('Chinese Target', 'zh', '第一章', '<p>合并译文。</p>')
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language='ja'),
+    )
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0], source_segments[1]],
+                target=[_segment('合并译文。', paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+        ],
+        source_lang='ja',
+        target_lang='zh',
+        granularity='sentence',
+    )
+
+    inline_output = tmp_path / 'cross-paragraph-anchor-inline.epub'
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        inline_output,
+        writeback_mode='inline',
+    )
+    inline_content = get_spine_documents(read_epub(inline_output))[0][1].get_content().decode('utf-8')
+    assert '<p>前句。</p>' in inline_content
+    assert '后句。<br/>合并译文。' in inline_content

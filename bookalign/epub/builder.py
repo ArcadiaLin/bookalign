@@ -24,7 +24,7 @@ from bookalign.epub.extractor import (
 )
 from bookalign.epub.reader import get_metadata, get_spine_documents
 from bookalign.epub.sentence_splitter import SentenceSplitter
-from bookalign.epub.tag_filters import TagFilterConfig
+from bookalign.epub.tag_filters import TagFilterConfig, build_tag_filter_config
 from bookalign.models.types import AlignmentResult, AlignedPair, Segment, TextSpan
 
 _BILINGUAL_CSS = """\
@@ -72,6 +72,8 @@ _VERTICAL_TO_HORIZONTAL_PUNCTUATION = str.maketrans({
     '︾': '》',
     '︿': '〈',
     '﹀': '〉',
+    '︵': '（',
+    '︶': '）',
     '﹁': '「',
     '﹂': '」',
     '﹃': '『',
@@ -86,22 +88,27 @@ class _ParagraphInjection:
     paragraph_cfi: str
     sequence: int
     target_texts: list[str] = field(default_factory=list)
+    target_segments: list[Segment] = field(default_factory=list)
 
 
 @dataclass
 class SourceLayoutBuilderConfig:
     source_lang: str
     target_lang: str
+    extract_mode: str = 'filtered'
     writeback_mode: str = 'paragraph'
     layout_direction: str = 'horizontal'
     emit_translation_metadata: bool = False
     normalize_vertical_punctuation: bool = True
+    note_anchor_map: dict[str, str] = field(default_factory=dict)
+    retained_doc_name: str = 'xhtml/bookalign-retained-target.xhtml'
 
 
 @dataclass
 class _InlineSentenceUnit:
     source_segments: list[Segment]
     target_text: str
+    target_segments: list[Segment]
     sequence: int
 
 
@@ -239,6 +246,7 @@ def build_bilingual_epub_on_source_layout(
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
     normalize_vertical_punctuation: bool = True,
+    extract_mode: str = 'filtered',
 ) -> None:
     """Write translations back into the source EPUB layout using source CFI anchors.
 
@@ -255,10 +263,12 @@ def build_bilingual_epub_on_source_layout(
     config = SourceLayoutBuilderConfig(
         source_lang=alignment.source_lang,
         target_lang=alignment.target_lang,
+        extract_mode=extract_mode,
         writeback_mode=writeback_mode,
         layout_direction=layout_direction,
         emit_translation_metadata=emit_translation_metadata,
         normalize_vertical_punctuation=normalize_vertical_punctuation,
+        note_anchor_map=_build_note_anchor_map(alignment) if extract_mode in {'full_text', 'filtered_preserve'} else {},
     )
     css_item = _ensure_css_item(
         source_book,
@@ -288,6 +298,18 @@ def build_bilingual_epub_on_source_layout(
         docs=docs,
         config=config,
     )
+    if extract_mode == 'full_text':
+        _append_unmatched_note_segments(
+            alignment=alignment,
+            docs=docs,
+            config=config,
+        )
+    elif extract_mode == 'filtered_preserve':
+        _append_retained_target_document(
+            alignment=alignment,
+            source_book=source_book,
+            config=config,
+        )
 
     _ensure_navigation_items(source_book)
     epub.write_epub(str(output_path), source_book)
@@ -304,6 +326,14 @@ def _collect_paragraph_injections(
     sequence = 0
 
     for pair in alignment.pairs:
+        target_segments = sorted(
+            pair.target,
+            key=lambda segment: (
+                segment.chapter_idx,
+                segment.paragraph_idx,
+                segment.sentence_idx or 0,
+            ),
+        )
         target_text = _join_segment_texts(pair.target)
         if pair.source:
             source_segments = sorted(
@@ -314,7 +344,7 @@ def _collect_paragraph_injections(
                     segment.sentence_idx or 0,
                 ),
             )
-            anchor = source_segments[0]
+            anchor = source_segments[-1]
             key = (anchor.chapter_idx, anchor.paragraph_idx)
             injection = buckets.setdefault(
                 key,
@@ -330,6 +360,7 @@ def _collect_paragraph_injections(
                     _append_translation_text(injection.target_texts, pending)
                 pending_target_only.clear()
             _append_translation_text(injection.target_texts, target_text)
+            injection.target_segments.extend(target_segments)
             last_key = key
             sequence += 1
             continue
@@ -340,6 +371,7 @@ def _collect_paragraph_injections(
             pending_target_only.append(target_text)
             continue
         _append_translation_text(buckets[last_key].target_texts, target_text)
+        buckets[last_key].target_segments.extend(target_segments)
 
     if pending_target_only and buckets:
         first_key = min(
@@ -403,6 +435,7 @@ def _apply_paragraph_source_layout(
                 book=source_book,
                 injection=injection,
                 config=config,
+                current_doc_name=doc.get_name(),
             ):
                 changed = True
 
@@ -421,7 +454,7 @@ def _apply_inline_source_layout(
         alignment,
         target_lang=config.target_lang,
     )
-    tag_config = TagFilterConfig()
+    tag_config = build_tag_filter_config(config.extract_mode)
     for chapter_idx, rewrites in rewrites_by_chapter.items():
         doc = docs.get(chapter_idx)
         if doc is None:
@@ -441,11 +474,266 @@ def _apply_inline_source_layout(
                 rewrite=rewrite,
                 config=config,
                 tag_config=tag_config,
+                current_doc_name=doc.get_name(),
             ):
                 changed = True
 
         if changed:
             _set_document_content(doc, root)
+
+
+def _append_unmatched_note_segments(
+    *,
+    alignment: AlignmentResult,
+    docs: dict[int, epub.EpubHtml],
+    config: SourceLayoutBuilderConfig,
+) -> None:
+    note_segments = _collect_unmatched_note_segments(alignment)
+    if not note_segments or not docs:
+        return
+
+    last_chapter_idx = max(docs)
+    doc = docs[last_chapter_idx]
+    root = _parse_raw_document_xml(doc)
+    _normalize_layout_root(root, layout_direction=config.layout_direction)
+    body = _find_body(root)
+    if body is None:
+        return
+
+    appendix = _make_xhtml_element(root, 'div')
+    appendix.set('class', 'bookalign-note-appendix')
+    heading = _make_xhtml_element(root, 'h2')
+    heading.text = '译注附录'
+    appendix.append(heading)
+    heading.tail = '\n'
+
+    seen: set[tuple[int, int, int | None, str]] = set()
+    for segment in note_segments:
+        key = (segment.chapter_idx, segment.paragraph_idx, segment.sentence_idx, segment.text)
+        if key in seen:
+            continue
+        seen.add(key)
+        paragraph = _make_xhtml_element(root, 'p')
+        _render_target_segments_into(
+            paragraph,
+            root=root,
+            segments=[segment],
+            config=config,
+            current_doc_name=doc.get_name(),
+        )
+        paragraph.tail = '\n'
+        appendix.append(paragraph)
+
+    appendix.tail = '\n'
+    body.append(appendix)
+    _set_document_content(doc, root)
+
+
+def _collect_retained_target_blocks(alignment: AlignmentResult) -> list[Segment]:
+    retained: list[Segment] = []
+    seen: set[tuple[int, int, str, str]] = set()
+    for segment in alignment.retained_target_segments:
+        key = (
+            segment.chapter_idx,
+            segment.paragraph_idx,
+            segment.paragraph_cfi or segment.cfi,
+            segment.raw_html or segment.text,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        retained.append(segment)
+    return retained
+
+
+def _retained_section_title(paratext_kind: str) -> str:
+    return {
+        'toc': '目录',
+        'note_body': '注释',
+        'frontmatter': '前后附文',
+        'backmatter': '前后附文',
+        'chapter_heading': '章节标题',
+        'metadata': '其他保留内容',
+    }.get(paratext_kind, '其他保留内容')
+
+
+def _append_retained_target_document(
+    *,
+    alignment: AlignmentResult,
+    source_book: epub.EpubBook,
+    config: SourceLayoutBuilderConfig,
+) -> None:
+    retained_blocks = _collect_retained_target_blocks(alignment)
+    if not retained_blocks:
+        return
+
+    appendix = epub.EpubHtml(
+        title='译文附录',
+        file_name=config.retained_doc_name,
+        lang=config.target_lang,
+    )
+    root = etree.fromstring(
+        (
+            '<?xml version="1.0" encoding="utf-8"?>'
+            '<html xmlns="http://www.w3.org/1999/xhtml">'
+            '<head><title>译文附录</title></head>'
+            '<body><div class="main"/></body>'
+            '</html>'
+        ).encode('utf-8'),
+        parser=etree.XMLParser(recover=True),
+    )
+    body = _find_body(root)
+    main = next(
+        (child for child in body if isinstance(child.tag, str) and _has_class(child, 'main')),
+        None,
+    )
+    if main is None:
+        main = _make_xhtml_element(root, 'div')
+        main.set('class', 'main')
+        body.append(main)
+
+    heading = _make_xhtml_element(root, 'h1')
+    heading.text = '译文附录'
+    heading.tail = '\n'
+    main.append(heading)
+
+    current_section = None
+    for segment in retained_blocks:
+        section_title = _retained_section_title(segment.paratext_kind)
+        if section_title != current_section:
+            section = _make_xhtml_element(root, 'h2')
+            section.text = section_title
+            section.tail = '\n'
+            main.append(section)
+            current_section = section_title
+
+        block = _render_retained_segment_block(
+            root=root,
+            segment=segment,
+            config=config,
+        )
+        block.tail = '\n'
+        main.append(block)
+
+    appendix.set_content(
+        etree.tostring(
+            root,
+            encoding='utf-8',
+            xml_declaration=True,
+            pretty_print=True,
+        )
+    )
+    _attach_stylesheet_link(appendix, 'styles/bookalign-source-layout.css')
+    source_book.add_item(appendix)
+    source_book.toc = tuple([*tuple(source_book.toc or ()), appendix])
+    source_book.spine = [*list(source_book.spine), appendix]
+    return
+
+
+def _render_retained_segment_block(
+    *,
+    root,
+    segment: Segment,
+    config: SourceLayoutBuilderConfig,
+):
+    rendered = _retained_block_from_raw_html(root=root, segment=segment, config=config)
+    if rendered is not None:
+        return rendered
+
+    paragraph = _make_xhtml_element(root, 'p')
+    if _preserve_target_markup(config):
+        _render_target_segments_into(
+            paragraph,
+            root=root,
+            segments=[segment],
+            config=config,
+            current_doc_name=config.retained_doc_name,
+        )
+    else:
+        paragraph.text = _normalize_target_text_for_layout(
+            segment.text,
+            target_lang=config.target_lang,
+            config=config,
+        )
+    return paragraph
+
+
+def _retained_block_from_raw_html(
+    *,
+    root,
+    segment: Segment,
+    config: SourceLayoutBuilderConfig,
+):
+    raw_html = (segment.raw_html or '').strip()
+    if not raw_html:
+        return None
+
+    namespace = etree.QName(root.tag).namespace if isinstance(root.tag, str) else None
+    wrapper_tag = f'{{{namespace}}}wrapper' if namespace else 'wrapper'
+    try:
+        wrapper = etree.fromstring(
+            f'<wrapper xmlns="{namespace or ""}">{raw_html}</wrapper>'.encode('utf-8'),
+            parser=etree.XMLParser(recover=True),
+        )
+    except etree.XMLSyntaxError:
+        return None
+    if wrapper is None or not len(wrapper):
+        return None
+
+    block = deepcopy(wrapper[0])
+    _rewrite_retained_subtree(
+        block,
+        config=config,
+        current_doc_name=config.retained_doc_name,
+    )
+    block.tag = block.tag if isinstance(block.tag, str) else wrapper_tag
+    return block
+
+
+def _rewrite_retained_subtree(
+    element,
+    *,
+    config: SourceLayoutBuilderConfig,
+    current_doc_name: str,
+) -> None:
+    if not isinstance(getattr(element, 'tag', None), str):
+        return
+
+    element_id = (element.get('id') or '').strip()
+    if element_id:
+        mapped_id = config.note_anchor_map.get(element_id)
+        if mapped_id:
+            element.set('id', mapped_id)
+
+    href = (element.get('href') or '').strip()
+    if href:
+        rewritten = _rewrite_note_href(
+            href,
+            config.note_anchor_map,
+            current_doc_name=current_doc_name,
+            appendix_doc_name=config.retained_doc_name if config.extract_mode == 'filtered_preserve' else '',
+        )
+        if rewritten:
+            element.set('href', rewritten)
+
+    if element.text:
+        element.text = _normalize_target_text_for_layout(
+            element.text,
+            target_lang=config.target_lang,
+            config=config,
+        )
+    if element.tail:
+        element.tail = _normalize_target_text_for_layout(
+            element.tail,
+            target_lang=config.target_lang,
+            config=config,
+        )
+    for child in element:
+        _rewrite_retained_subtree(
+            child,
+            config=config,
+            current_doc_name=current_doc_name,
+        )
 
 
 def _append_translation_text(target_texts: list[str], text: str) -> None:
@@ -463,6 +751,148 @@ def _join_translation_texts(target_texts: list[str], target_lang: str) -> str:
     return joiner.join(normalized)
 
 
+def _build_note_anchor_map(alignment: AlignmentResult) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    counter = 1
+    target_segments = [
+        *(segment for pair in alignment.pairs for segment in pair.target),
+        *alignment.retained_target_segments,
+    ]
+    for segment in target_segments:
+        for fragment in segment.jump_fragments:
+            if fragment.kind != 'id' or not fragment.anchor_id:
+                continue
+            if fragment.anchor_id in mapping:
+                continue
+            mapping[fragment.anchor_id] = f'bookalign-note-{counter:04d}'
+            counter += 1
+    return mapping
+
+
+def _collect_unmatched_note_segments(alignment: AlignmentResult) -> list[Segment]:
+    collected: list[Segment] = []
+    seen: set[tuple[int, int, int | None, str]] = set()
+    for pair in alignment.pairs:
+        if pair.source:
+            continue
+        for segment in pair.target:
+            if not (segment.is_note_like or segment.has_jump_markup):
+                continue
+            key = (segment.chapter_idx, segment.paragraph_idx, segment.sentence_idx, segment.text)
+            if key in seen:
+                continue
+            collected.append(segment)
+            seen.add(key)
+    return collected
+
+
+def _target_joiner(target_lang: str) -> str:
+    return '' if target_lang.split('-', 1)[0].casefold() in _CJK_LANGS else ' '
+
+
+def _preserve_target_markup(config: SourceLayoutBuilderConfig) -> bool:
+    return config.extract_mode in {'full_text', 'filtered_preserve'}
+
+
+def _rewrite_note_href(
+    href: str,
+    note_anchor_map: dict[str, str],
+    *,
+    current_doc_name: str = '',
+    appendix_doc_name: str = '',
+) -> str:
+    normalized = (href or '').strip()
+    if not normalized.startswith('#'):
+        return normalized
+    anchor_id = normalized[1:]
+    mapped = note_anchor_map.get(anchor_id)
+    if not mapped:
+        return normalized
+    if appendix_doc_name and current_doc_name and current_doc_name != appendix_doc_name:
+        return f'{_relative_href(current_doc_name, appendix_doc_name)}#{mapped}'
+    return f'#{mapped}'
+
+
+def _render_target_segments_into(
+    parent,
+    *,
+    root,
+    segments: list[Segment],
+    config: SourceLayoutBuilderConfig,
+    current_doc_name: str = '',
+) -> None:
+    rendered_segments = [segment for segment in segments if segment.text.strip()]
+    joiner = _target_joiner(config.target_lang)
+    for index, segment in enumerate(rendered_segments):
+        _render_target_segment_into(
+            parent,
+            root=root,
+            segment=segment,
+            config=config,
+            current_doc_name=current_doc_name,
+        )
+        if joiner and index < len(rendered_segments) - 1:
+            _append_piece(parent, joiner)
+
+
+def _render_target_segment_into(
+    parent,
+    *,
+    root,
+    segment: Segment,
+    config: SourceLayoutBuilderConfig,
+    current_doc_name: str = '',
+) -> None:
+    anchor_ids = [
+        config.note_anchor_map.get(fragment.anchor_id, fragment.anchor_id)
+        for fragment in segment.jump_fragments
+        if fragment.kind == 'id' and fragment.anchor_id
+    ]
+    for anchor_id in anchor_ids:
+        anchor = _make_xhtml_element(root, 'a')
+        anchor.set('id', anchor_id)
+        _append_piece(parent, anchor)
+
+    normalized_text = _normalize_target_text_for_layout(
+        segment.text,
+        target_lang=config.target_lang,
+        config=config,
+    )
+    href_fragments = sorted(
+        [
+            fragment
+            for fragment in segment.jump_fragments
+            if fragment.kind == 'href'
+            and fragment.start is not None
+            and fragment.end is not None
+            and fragment.start < fragment.end
+        ],
+        key=lambda item: (item.start or 0, item.end or 0),
+    )
+    cursor = 0
+    for fragment in href_fragments:
+        start = max(fragment.start or 0, cursor)
+        end = min(fragment.end or 0, len(normalized_text))
+        if start > cursor:
+            _append_piece(parent, normalized_text[cursor:start])
+        if start < end:
+            anchor = _make_xhtml_element(root, 'a')
+            anchor.set(
+                'href',
+                _rewrite_note_href(
+                    fragment.href,
+                    config.note_anchor_map,
+                    current_doc_name=current_doc_name,
+                    appendix_doc_name=config.retained_doc_name if config.extract_mode == 'filtered_preserve' else '',
+                ),
+            )
+            anchor.text = normalized_text[start:end]
+            _append_piece(parent, anchor)
+        cursor = max(cursor, end)
+    if cursor < len(normalized_text):
+        _append_piece(parent, normalized_text[cursor:])
+
+
 def _collect_inline_paragraph_rewrites(
     alignment: AlignmentResult,
     *,
@@ -474,6 +904,14 @@ def _collect_inline_paragraph_rewrites(
     sequence = 0
 
     for pair in alignment.pairs:
+        target_segments = sorted(
+            pair.target,
+            key=lambda segment: (
+                segment.chapter_idx,
+                segment.paragraph_idx,
+                segment.sentence_idx or 0,
+            ),
+        )
         target_text = _join_segment_texts(pair.target)
         source_segments = sorted(
             pair.source,
@@ -484,7 +922,7 @@ def _collect_inline_paragraph_rewrites(
             ),
         )
         if source_segments:
-            anchor = source_segments[0]
+            anchor = source_segments[-1]
             key = (anchor.chapter_idx, anchor.paragraph_idx)
             rewrite = buckets.setdefault(
                 key,
@@ -507,6 +945,7 @@ def _collect_inline_paragraph_rewrites(
                         _InlineSentenceUnit(
                             source_segments=source_segments,
                             target_text=pending_text,
+                            target_segments=[],
                             sequence=sequence,
                         )
                     )
@@ -517,6 +956,7 @@ def _collect_inline_paragraph_rewrites(
                 _InlineSentenceUnit(
                     source_segments=source_segments,
                     target_text=target_text.strip(),
+                    target_segments=target_segments,
                     sequence=sequence,
                 )
             )
@@ -565,6 +1005,7 @@ def _inject_translation_block(
     book: epub.EpubBook,
     injection: _ParagraphInjection,
     config: SourceLayoutBuilderConfig,
+    current_doc_name: str,
 ) -> bool:
     resolved = resolve_cfi(injection.paragraph_cfi, book, _root=root)
     block = _resolve_block_anchor(resolved)
@@ -576,6 +1017,7 @@ def _inject_translation_block(
         source_block=block,
         injection=injection,
         config=config,
+        current_doc_name=current_doc_name,
     )
     separator_block = _build_translation_separator(root)
     if config.emit_translation_metadata:
@@ -637,6 +1079,7 @@ def _build_translation_block(
     source_block,
     injection: _ParagraphInjection,
     config: SourceLayoutBuilderConfig,
+    current_doc_name: str,
 ):
     tag = _translation_tag_for_block(source_block)
     block = _make_xhtml_element(root, tag)
@@ -645,11 +1088,20 @@ def _build_translation_block(
         block.set('lang', config.target_lang)
         block.set('data-bookalign-anchor-cfi', injection.paragraph_cfi)
         block.set('data-bookalign-paragraph', str(injection.paragraph_idx))
-    block.text = _normalize_target_text_for_layout(
-        ''.join(injection.target_texts),
-        target_lang=config.target_lang,
-        config=config,
-    )
+    if _preserve_target_markup(config) and injection.target_segments:
+        _render_target_segments_into(
+            block,
+            root=root,
+            segments=injection.target_segments,
+            config=config,
+            current_doc_name=current_doc_name,
+        )
+    else:
+        block.text = _normalize_target_text_for_layout(
+            ''.join(injection.target_texts),
+            target_lang=config.target_lang,
+            config=config,
+        )
     block.tail = '\n'
 
     return block
@@ -706,6 +1158,7 @@ def _rewrite_inline_paragraph(
     rewrite: _InlineParagraphRewrite,
     config: SourceLayoutBuilderConfig,
     tag_config: TagFilterConfig,
+    current_doc_name: str,
 ) -> bool:
     resolved = resolve_cfi(rewrite.paragraph_cfi, book, _root=root)
     block = _resolve_block_anchor(resolved)
@@ -759,14 +1212,23 @@ def _rewrite_inline_paragraph(
 
         if unit.target_text:
             _append_break(block, root)
-            _append_piece(
-                block,
-                _normalize_target_text_for_layout(
-                    unit.target_text,
-                    target_lang=config.target_lang,
+            if _preserve_target_markup(config) and unit.target_segments:
+                _render_target_segments_into(
+                    block,
+                    root=root,
+                    segments=unit.target_segments,
                     config=config,
-                ),
-            )
+                    current_doc_name=current_doc_name,
+                )
+            else:
+                _append_piece(
+                    block,
+                    _normalize_target_text_for_layout(
+                        unit.target_text,
+                        target_lang=config.target_lang,
+                        config=config,
+                    ),
+                )
             emitted = True
         if unit_index < len(rewrite.units) - 1:
             _append_break(block, root)

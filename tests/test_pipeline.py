@@ -155,6 +155,128 @@ def test_match_extracted_chapters_raw_mode_keeps_paratext_candidates():
     assert [match.target_chapter.spine_idx for match in matches] == [0, 1, 2, 3]
 
 
+def test_extract_sentence_chapters_full_text_keeps_toc_and_notes():
+    book = _book(
+        'Target',
+        'zh',
+        [
+            (
+                '目录',
+                '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav>'
+                '<p>正文<a class="noteref" href="#note-1">1</a>。</p>'
+                '<div class="annotation" id="footnote-1"><p id="note-1">注释正文。</p></div>',
+            ),
+        ],
+    )
+
+    filtered = extract_sentence_chapters(book, language='zh', extract_mode='filtered')
+    full_text = extract_sentence_chapters(book, language='zh', extract_mode='full_text')
+
+    assert len(filtered) == 1
+    assert [segment.text for segment in filtered[0].segments] == ['正文。']
+    assert [segment.text for segment in full_text[0].segments][:3] == ['第一章', '正文1。', '注释正文。']
+
+
+def test_extract_sentence_chapters_filtered_preserve_splits_alignment_and_retained_segments():
+    book = _book(
+        'Target',
+        'zh',
+        [
+            (
+                '目录',
+                '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav>'
+                '<p>正文<a class="noteref" href="#note-1">1</a>。</p>'
+                '<div class="annotation" id="footnote-1"><p id="note-1">注释正文。</p></div>',
+            ),
+        ],
+    )
+
+    chapters = extract_sentence_chapters(book, language='zh', extract_mode='filtered_preserve')
+
+    assert len(chapters) == 1
+    assert [segment.text for segment in chapters[0].segments] == ['第一章', '正文1。', '注释正文。']
+    assert [segment.text for segment in chapters[0].alignment_segments] == ['正文1。']
+    assert [segment.text for segment in chapters[0].retained_segments] == ['第一章', '注释正文。']
+
+
+def test_align_books_full_text_defaults_to_raw_chapter_matching():
+    source_book = _book(
+        'Source',
+        'ja',
+        [
+            (
+                '目次',
+                '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav><p>甲。</p>',
+            ),
+        ],
+    )
+    target_book = _book(
+        'Target',
+        'zh',
+        [
+            (
+                '目录',
+                '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav><p>乙。</p>',
+            ),
+        ],
+    )
+    aligner = StubAligner()
+
+    result = align_books(
+        source_book,
+        target_book,
+        source_lang='ja',
+        target_lang='zh',
+        extract_mode='full_text',
+        aligner=aligner,
+    )
+
+    assert len(aligner.calls) == 1
+    assert aligner.calls[0][0][0] == '第一章'
+    assert aligner.calls[0][1][0] == '第一章'
+    assert result.pairs
+
+
+def test_align_books_filtered_preserve_aligns_only_body_and_retains_paratext():
+    source_book = _book(
+        'Source',
+        'ja',
+        [
+            (
+                '第一章',
+                '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav><p>甲。</p>',
+            ),
+        ],
+    )
+    target_book = _book(
+        'Target',
+        'zh',
+        [
+            (
+                '第一章',
+                '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav>'
+                '<p>乙<a class="noteref" href="#note-1">1</a>。</p>'
+                '<aside epub:type="footnote"><p id="note-1">注释正文。</p></aside>',
+            ),
+        ],
+    )
+    aligner = StubAligner()
+
+    result = align_books(
+        source_book,
+        target_book,
+        source_lang='ja',
+        target_lang='zh',
+        extract_mode='filtered_preserve',
+        aligner=aligner,
+    )
+
+    assert len(aligner.calls) == 1
+    assert aligner.calls[0] == (['甲。'], ['乙1。'])
+    assert [segment.text for segment in result.retained_target_segments] == ['第一章', '注释正文。']
+    assert result.extract_mode == 'filtered_preserve'
+
+
 def test_align_books_uses_chapter_matching_before_sentence_alignment():
     source_book = _book(
         'Source',

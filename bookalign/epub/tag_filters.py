@@ -117,6 +117,33 @@ def _default_policies() -> list[ElementPolicy]:
     ]
 
 
+def _full_text_policies() -> list[ElementPolicy]:
+    policies = [
+        policy
+        for policy in _default_policies()
+        if policy.name not in {
+            'skip-toc-nav',
+            'skip-doc-toc',
+            'skip-footnote-aside',
+            'skip-noteref-class',
+            'skip-noteref-epub-type',
+            'skip-super',
+            'skip-annotation-class',
+            'skip-toc-class',
+            'skip-known-id',
+            'skip-footnote-link',
+        }
+    ]
+    policies.extend(
+        [
+            ElementPolicy(tag='nav', epub_type='toc', action=ExtractAction.STRUCTURAL_CONTAINER, name='keep-toc-nav-children'),
+            ElementPolicy(role='doc-toc', action=ExtractAction.STRUCTURAL_CONTAINER, name='keep-doc-toc-children'),
+            ElementPolicy(tag='aside', epub_type='footnote', action=ExtractAction.STRUCTURAL_CONTAINER, name='keep-footnote-aside-children'),
+        ]
+    )
+    return policies
+
+
 @dataclass
 class TagFilterConfig:
     """Policy configuration for XHTML text extraction."""
@@ -224,6 +251,22 @@ class TagFilterConfig:
             )
 
         self.policies.extend(legacy_policies)
+
+
+def build_tag_filter_config(extract_mode: str = 'filtered') -> TagFilterConfig:
+    """Build an extraction profile configuration."""
+
+    if extract_mode == 'filtered':
+        return TagFilterConfig()
+    if extract_mode in {'full_text', 'filtered_preserve'}:
+        return TagFilterConfig(
+            skip_tags={'rt', 'rp', 'script', 'style', 'svg', 'math', 'img'},
+            skip_classes=set(),
+            skip_rules=[],
+            policies=_full_text_policies(),
+            apply_segment_heuristics=False,
+        )
+    raise ValueError(f'Unsupported extract_mode: {extract_mode}')
 
 
 def match_element_policy(element, config: TagFilterConfig) -> ElementPolicy | None:

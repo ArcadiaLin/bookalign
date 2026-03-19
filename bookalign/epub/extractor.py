@@ -14,12 +14,13 @@ from bookalign.epub.tag_filters import (
     ExtractAction,
     TagFilterConfig,
     _local_tag,
+    build_tag_filter_config,
     get_extract_action,
     is_block_element,
     is_structural_container,
     match_element_policy,
 )
-from bookalign.models.types import DebugSpan, Segment, TextSpan
+from bookalign.models.types import DebugSpan, JumpFragment, Segment, TextSpan
 
 _SENTENCE_PUNCT_RE = re.compile(r'[。！？!?…]|[.!?]["”’」』）)]?$')
 _LATIN_LETTER_RE = re.compile(r'[A-Za-z]')
@@ -32,6 +33,8 @@ _DIALOGUE_TAG_RE = re.compile(
     r')\b',
     re.IGNORECASE,
 )
+_NOTE_ID_RE = re.compile(r'(?:^|[-_])(fn|note|footnote|endnote|backlink|注)(?:[-_0-9].*)?$', re.IGNORECASE)
+_NOTE_HREF_RE = re.compile(r'#(?:fn|note|footnote|endnote|注)', re.IGNORECASE)
 
 
 def extract_segments(
@@ -40,10 +43,12 @@ def extract_segments(
     chapter_idx: int,
     config: TagFilterConfig | None = None,
     splitter: SentenceSplitter | None = None,
+    extract_mode: str = 'filtered',
 ) -> list[Segment]:
     """Extract paragraph or sentence segments from an XHTML document."""
 
-    config = config or TagFilterConfig()
+    if config is None:
+        config = build_tag_filter_config(extract_mode)
     root = parse_item_xml(doc)
     tree = root.getroottree()
     segments: list[Segment] = []
@@ -51,6 +56,8 @@ def extract_segments(
 
     for elem in root.iter():
         if not isinstance(elem.tag, str):
+            continue
+        if _has_skipped_ancestor(elem, config):
             continue
         if get_extract_action(elem, config) != ExtractAction.BLOCK_BREAK:
             continue
@@ -78,8 +85,23 @@ def extract_segments(
         raw_html = etree.tostring(elem, encoding='unicode', method='html')
         element_xpath = tree.getpath(elem)
         paragraph_text = ''.join(span.text for span in trimmed_spans)
-        if not _should_emit_segment(elem, paragraph_text, raw_html, config):
+        should_emit, alignment_role, paratext_kind, filter_reason = _segment_extraction_decision(
+            elem,
+            paragraph_text,
+            raw_html,
+            config,
+            extract_mode=extract_mode,
+        )
+        if not should_emit:
             continue
+
+        paragraph_jumps = _collect_jump_fragments(
+            element=elem,
+            spans=trimmed_spans,
+            boundaries=_build_span_boundaries(trimmed_spans),
+        )
+        has_jump_markup = bool(paragraph_jumps)
+        is_note_like = _is_note_like_block(elem)
 
         if splitter is None:
             segments.append(
@@ -94,6 +116,12 @@ def extract_segments(
                     text_end=len(paragraph_text),
                     raw_html=raw_html,
                     element_xpath=element_xpath,
+                    has_jump_markup=has_jump_markup,
+                    is_note_like=is_note_like,
+                    alignment_role=alignment_role,
+                    paratext_kind=paratext_kind,
+                    filter_reason=filter_reason,
+                    jump_fragments=paragraph_jumps,
                     spans=[_clone_span(span) for span in trimmed_spans],
                 )
             )
@@ -112,6 +140,11 @@ def extract_segments(
                     paragraph_cfi=para_cfi or '',
                     spans=trimmed_spans,
                     sentences=sentences,
+                    paragraph_jump_fragments=paragraph_jumps,
+                    is_note_like=is_note_like,
+                    alignment_role=alignment_role,
+                    paratext_kind=paratext_kind,
+                    filter_reason=filter_reason,
                 )
             )
 
@@ -121,38 +154,73 @@ def extract_segments(
 
 
 def _should_emit_segment(element, text: str, raw_html: str, config: TagFilterConfig) -> bool:
-    if not config.apply_segment_heuristics:
-        return True
+    should_emit, _, _, _ = _segment_extraction_decision(
+        element,
+        text,
+        raw_html,
+        config,
+        extract_mode='filtered',
+    )
+    return should_emit
 
+
+def _segment_extraction_decision(
+    element,
+    text: str,
+    raw_html: str,
+    config: TagFilterConfig,
+    *,
+    extract_mode: str,
+) -> tuple[bool, str, str, str]:
     normalized = SentenceSplitter.normalize_text(text)
     if not normalized:
-        return False
+        return False, 'retain', 'metadata', 'empty'
 
-    lower = normalized.casefold()
-    if any(re.search(pattern, lower, re.IGNORECASE) for pattern in config.skip_text_patterns):
-        return False
+    if extract_mode == 'full_text':
+        return True, 'align', _classify_paratext_kind(element, normalized, config), ''
 
-    if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in config.skip_line_patterns):
-        return False
+    paratext_kind, filter_reason = _classify_paratext_kind(element, normalized, config)
+    if paratext_kind == 'body':
+        return True, 'align', 'body', ''
+    if extract_mode == 'filtered_preserve':
+        return True, 'retain', paratext_kind, filter_reason
+    return False, 'retain', paratext_kind, filter_reason
 
-    words = normalized.split()
-    if len(words) <= 12 and any(re.search(pattern, normalized, re.IGNORECASE) for pattern in config.skip_heading_patterns):
-        return False
 
-    if len(words) <= 10 and not _SENTENCE_PUNCT_RE.search(normalized):
-        if _looks_like_heading_or_metadata(normalized):
-            return False
-
+def _classify_paratext_kind(element, text: str, config: TagFilterConfig) -> tuple[str, str]:
+    lower = text.casefold()
     classes = set(element.get('class', '').split())
     element_id = element.get('id', '')
-    if classes & {'toc', 'title', 'titlepage', 'copyright', 'license', 'contents'}:
-        return False
-    if re.search(r'(toc|contents|copyright|license|colophon)', element_id, re.IGNORECASE):
-        return False
-    if _looks_like_navigation_block(element, normalized):
-        return False
 
-    return True
+    if _element_has_note_traits(element):
+        return 'note_body', 'note_block'
+
+    if classes & {'toc', 'contents'}:
+        return 'toc', 'toc_class'
+    if re.search(r'(toc|contents|nav)', element_id, re.IGNORECASE):
+        return 'toc', 'toc_id'
+    if _looks_like_navigation_block(element, text):
+        return 'toc', 'navigation_block'
+
+    if classes & {'title', 'titlepage'}:
+        return 'frontmatter', 'title_class'
+    if classes & {'copyright', 'license'}:
+        return 'metadata', 'copyright_class'
+    if re.search(r'(copyright|license|colophon|isbn)', element_id, re.IGNORECASE):
+        return 'metadata', 'metadata_id'
+
+    if any(re.search(pattern, lower, re.IGNORECASE) for pattern in config.skip_text_patterns):
+        return 'metadata', 'skip_text_pattern'
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in config.skip_line_patterns):
+        return 'metadata', 'skip_line_pattern'
+
+    words = text.split()
+    if len(words) <= 12 and any(re.search(pattern, text, re.IGNORECASE) for pattern in config.skip_heading_patterns):
+        return 'chapter_heading', 'skip_heading_pattern'
+    if len(words) <= 10 and not _SENTENCE_PUNCT_RE.search(text) and _looks_like_heading_or_metadata(text):
+        return 'chapter_heading', 'heading_or_metadata'
+
+    return 'body', ''
 
 
 def _looks_like_heading_or_metadata(text: str) -> bool:
@@ -198,6 +266,145 @@ def _looks_like_navigation_block(element, text: str) -> bool:
     if _local_tag(element.tag) == 'li' and hrefs and all('#' in href for href in hrefs):
         return True
     return False
+
+
+def _has_skipped_ancestor(element, config: TagFilterConfig) -> bool:
+    parent = element.getparent()
+    while parent is not None and isinstance(getattr(parent, 'tag', None), str):
+        if get_extract_action(parent, config) == ExtractAction.SKIP_ENTIRE:
+            return True
+        parent = parent.getparent()
+    return False
+
+
+def _is_note_href(href: str) -> bool:
+    normalized = (href or '').strip()
+    return bool(normalized and _NOTE_HREF_RE.search(normalized))
+
+
+def _is_note_id(anchor_id: str) -> bool:
+    normalized = (anchor_id or '').strip()
+    return bool(normalized and _NOTE_ID_RE.search(normalized))
+
+
+def _element_has_note_traits(element) -> bool:
+    if not isinstance(getattr(element, 'tag', None), str):
+        return False
+    classes = set((element.get('class') or '').split())
+    epub_types = set((element.get('{http://www.idpf.org/2007/ops}type') or '').split())
+    if classes & {'noteref', 'footnote-ref', 'super', 'annotation'}:
+        return True
+    if epub_types & {'noteref', 'footnote', 'endnote'}:
+        return True
+    if _is_note_id(element.get('id', '')):
+        return True
+    return _is_note_href(element.get('href', ''))
+
+
+def _is_note_like_block(element) -> bool:
+    if _element_has_note_traits(element):
+        return True
+    return any(_element_has_note_traits(child) for child in element.iterdescendants() if isinstance(child.tag, str))
+
+
+def _nearest_jump_element(node):
+    current = node
+    while current is not None and isinstance(getattr(current, 'tag', None), str):
+        if _local_tag(current.tag) == 'a' and _is_note_href(current.get('href', '')):
+            return current
+        current = current.getparent()
+    return None
+
+
+def _collect_jump_fragments(
+    *,
+    element,
+    spans: list[TextSpan],
+    boundaries: list[tuple[int, int, TextSpan]],
+) -> list[JumpFragment]:
+    fragments: list[JumpFragment] = []
+    active_href: str | None = None
+    active_start: int | None = None
+    active_end: int | None = None
+    active_text_parts: list[str] = []
+
+    def flush_href() -> None:
+        nonlocal active_href, active_start, active_end, active_text_parts
+        if active_href and active_start is not None and active_end is not None and active_start < active_end:
+            fragments.append(
+                JumpFragment(
+                    kind='href',
+                    text=''.join(active_text_parts),
+                    start=active_start,
+                    end=active_end,
+                    href=active_href,
+                )
+            )
+        active_href = None
+        active_start = None
+        active_end = None
+        active_text_parts = []
+
+    for start, end, span in boundaries:
+        owner = getattr(span, '_node', None)
+        jump_node = _nearest_jump_element(owner) if owner is not None else None
+        href = (jump_node.get('href') or '').strip() if jump_node is not None else ''
+        if not href:
+            flush_href()
+            continue
+        if href != active_href:
+            flush_href()
+            active_href = href
+            active_start = start
+        active_end = end
+        active_text_parts.append(span.text)
+    flush_href()
+
+    seen_ids: set[str] = set()
+    for node in [element, *[child for child in element.iterdescendants() if isinstance(child.tag, str)]]:
+        anchor_id = (node.get('id') or '').strip()
+        if anchor_id and _is_note_id(anchor_id) and anchor_id not in seen_ids:
+            fragments.append(
+                JumpFragment(
+                    kind='id',
+                    anchor_id=anchor_id,
+                )
+            )
+            seen_ids.add(anchor_id)
+
+    return fragments
+
+
+def _slice_jump_fragments(
+    fragments: list[JumpFragment],
+    sent_start: int,
+    sent_end: int,
+) -> list[JumpFragment]:
+    sliced: list[JumpFragment] = []
+    for fragment in fragments:
+        if fragment.kind == 'id':
+            if sent_start == 0:
+                sliced.append(fragment)
+            continue
+        if fragment.start is None or fragment.end is None:
+            continue
+        overlap_start = max(sent_start, fragment.start)
+        overlap_end = min(sent_end, fragment.end)
+        if overlap_start >= overlap_end:
+            continue
+        text_start = overlap_start - fragment.start
+        text_end = overlap_end - fragment.start
+        sliced.append(
+            JumpFragment(
+                kind=fragment.kind,
+                text=fragment.text[text_start:text_end],
+                start=overlap_start - sent_start,
+                end=overlap_end - sent_start,
+                href=fragment.href,
+                anchor_id=fragment.anchor_id,
+            )
+        )
+    return sliced
 
 
 def collect_debug_spans(element, config: TagFilterConfig | None = None) -> list[DebugSpan]:
@@ -636,6 +843,11 @@ def _map_sentences_to_segments(
     paragraph_cfi: str,
     spans: list[TextSpan],
     sentences: list[str],
+    paragraph_jump_fragments: list[JumpFragment],
+    is_note_like: bool,
+    alignment_role: str,
+    paratext_kind: str,
+    filter_reason: str,
 ) -> list[Segment]:
     """Map split sentences back to subsets of paragraph spans."""
 
@@ -654,6 +866,7 @@ def _map_sentences_to_segments(
         sentence_spans = _slice_spans(boundaries, sent_start, sent_end)
         if not sentence_spans:
             continue
+        sentence_jump_fragments = _slice_jump_fragments(paragraph_jump_fragments, sent_start, sent_end)
 
         start_span = sentence_spans[0]
         end_span = sentence_spans[-1]
@@ -681,6 +894,12 @@ def _map_sentences_to_segments(
                 text_end=sent_end,
                 raw_html=raw_html,
                 element_xpath=element_xpath,
+                has_jump_markup=bool(sentence_jump_fragments),
+                is_note_like=is_note_like,
+                alignment_role=alignment_role,
+                paratext_kind=paratext_kind,
+                filter_reason=filter_reason,
+                jump_fragments=sentence_jump_fragments,
                 spans=[_clone_span(span) for span in sentence_spans],
             )
         )

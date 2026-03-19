@@ -30,6 +30,7 @@ from bookalign.epub.tag_filters import (
     ElementPolicy,
     TagFilterConfig,
     _local_tag,
+    build_tag_filter_config,
     get_extract_action,
     match_element_policy,
     should_skip_element,
@@ -128,6 +129,29 @@ def test_collect_text_spans_applies_policy_actions_consistently():
     assert ''.join(span.text for span in spans).strip() == '甲漢字乙 丙'
     assert all('注' not in span.text for span in spans)
     assert all('1' not in span.text for span in spans)
+
+
+def test_full_text_profile_keeps_note_refs_and_footnotes():
+    root = _xml_root(
+        """
+        <html xmlns:epub="http://www.idpf.org/2007/ops">
+          <body>
+            <nav epub:type="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav>
+            <p>甲<span class="super">注</span><a class="noteref" href="#note-1">1</a>乙</p>
+            <aside epub:type="footnote"><p id="note-1">注释正文。</p></aside>
+          </body>
+        </html>
+        """
+    )
+    paragraph = root.xpath('.//*[local-name()="p"]')[0]
+    footnote_paragraph = root.xpath('.//*[local-name()="aside"]//*[local-name()="p"]')[0]
+    config = build_tag_filter_config('full_text')
+
+    paragraph_spans = _collect_text_spans(paragraph, root.getroottree(), config)
+    footnote_spans = _collect_text_spans(footnote_paragraph, root.getroottree(), config)
+
+    assert ''.join(span.text for span in paragraph_spans).strip() == '甲注1乙'
+    assert ''.join(span.text for span in footnote_spans).strip() == '注释正文。'
 
 
 def test_collect_debug_spans_emits_debug_metadata():
@@ -303,6 +327,91 @@ def test_extract_segments_does_not_misclassify_dense_anchor_paragraph_as_navigat
 
     assert segments
     assert any(segment.text.startswith('美──美這玩意太可怕了！') for segment in segments)
+
+
+def test_extract_segments_full_text_marks_jump_metadata():
+    book = epub.EpubBook()
+    book.set_identifier('jump-metadata-test')
+    book.set_title('Jump Metadata Test')
+    book.set_language('zh')
+    chapter = epub.EpubHtml(title='第一章', file_name='chapter1.xhtml', lang='zh')
+    chapter.set_content(
+        '<p>正文<a class="noteref" href="#note-1">1</a>。</p>'
+        '<aside epub:type="footnote"><p id="note-1">注释正文。</p></aside>'
+    )
+    book.add_item(chapter)
+    book.spine = [chapter]
+    book.toc = (chapter,)
+
+    chapter_idx, doc = get_spine_documents(book)[0]
+    segments = extract_segments(
+        book,
+        doc,
+        chapter_idx=chapter_idx,
+        splitter=SentenceSplitter(language='zh'),
+        extract_mode='full_text',
+    )
+
+    assert [segment.text for segment in segments] == ['正文1。', '注释正文。']
+    assert segments[0].has_jump_markup is True
+    assert any(fragment.kind == 'href' and fragment.href == '#note-1' for fragment in segments[0].jump_fragments)
+    assert segments[1].is_note_like is True
+    assert any(fragment.kind == 'id' and fragment.anchor_id == 'note-1' for fragment in segments[1].jump_fragments)
+
+
+def test_extract_segments_filtered_preserve_marks_retained_paratext_without_dropping_note_refs():
+    book = epub.EpubBook()
+    book.set_identifier('filtered-preserve-test')
+    book.set_title('Filtered Preserve Test')
+    book.set_language('zh')
+    chapter = epub.EpubHtml(title='目录', file_name='chapter1.xhtml', lang='zh')
+    chapter.set_content(
+        '<nav class="toc"><ol><li><a href="#c1">第一章</a></li></ol></nav>'
+        '<p>正文<a class="noteref" href="#note-1">1</a>。</p>'
+        '<aside epub:type="footnote"><p id="note-1">注释正文。</p></aside>'
+    )
+    book.add_item(chapter)
+    book.spine = [chapter]
+    book.toc = (chapter,)
+
+    chapter_idx, doc = get_spine_documents(book)[0]
+    segments = extract_segments(
+        book,
+        doc,
+        chapter_idx=chapter_idx,
+        splitter=SentenceSplitter(language='zh'),
+        extract_mode='filtered_preserve',
+    )
+
+    assert [segment.text for segment in segments] == ['第一章', '正文1。', '注释正文。']
+    assert [segment.alignment_role for segment in segments] == ['retain', 'align', 'retain']
+    assert [segment.paratext_kind for segment in segments] == ['toc', 'body', 'note_body']
+    assert any(fragment.kind == 'href' and fragment.href == '#note-1' for fragment in segments[1].jump_fragments)
+
+
+def test_extract_segments_skips_blocks_inside_skipped_ancestor_in_filtered_mode():
+    book = epub.EpubBook()
+    book.set_identifier('skipped-ancestor-test')
+    book.set_title('Skipped Ancestor Test')
+    book.set_language('zh')
+    chapter = epub.EpubHtml(title='第一章', file_name='chapter1.xhtml', lang='zh')
+    chapter.set_content(
+        '<div class="annotation"><p>注释正文。</p></div>'
+        '<p>正文。</p>'
+    )
+    book.add_item(chapter)
+    book.spine = [chapter]
+    book.toc = (chapter,)
+
+    chapter_idx, doc = get_spine_documents(book)[0]
+    segments = extract_segments(
+        book,
+        doc,
+        chapter_idx=chapter_idx,
+        splitter=SentenceSplitter(language='zh'),
+    )
+
+    assert [segment.text for segment in segments] == ['正文。']
 
 
 def _book_path(pattern: str) -> Path:

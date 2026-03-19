@@ -1,5 +1,7 @@
 """Core data structures for extraction and alignment."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 
 
@@ -36,6 +38,18 @@ class DebugSpan:
 
 
 @dataclass
+class JumpFragment:
+    """Structured note/jump metadata extracted from inline markup."""
+
+    kind: str
+    text: str = ''
+    start: int | None = None
+    end: int | None = None
+    href: str = ''
+    anchor_id: str = ''
+
+
+@dataclass
 class Segment:
     """A paragraph-level or sentence-level text unit used for alignment."""
 
@@ -49,6 +63,12 @@ class Segment:
     text_end: int | None = None
     raw_html: str = ''
     element_xpath: str = ''
+    has_jump_markup: bool = False
+    is_note_like: bool = False
+    alignment_role: str = 'align'
+    paratext_kind: str = 'body'
+    filter_reason: str = ''
+    jump_fragments: list[JumpFragment] = field(default_factory=list)
     spans: list[TextSpan] = field(default_factory=list)
 
 
@@ -69,3 +89,6 @@ class AlignmentResult:
     source_lang: str
     target_lang: str
     granularity: str
+    extract_mode: str = 'filtered'
+    retained_source_segments: list[Segment] = field(default_factory=list)
+    retained_target_segments: list[Segment] = field(default_factory=list)

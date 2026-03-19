@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from bookalign.models.types import AlignmentResult, AlignedPair, Segment, TextSpan
+from bookalign.models.types import AlignmentResult, AlignedPair, JumpFragment, Segment, TextSpan
 
 
 def save_alignment_result(alignment: AlignmentResult, path: str | Path) -> Path:
@@ -13,7 +13,10 @@ def save_alignment_result(alignment: AlignmentResult, path: str | Path) -> Path:
         'source_lang': alignment.source_lang,
         'target_lang': alignment.target_lang,
         'granularity': alignment.granularity,
+        'extract_mode': alignment.extract_mode,
         'pairs': [_pair_to_dict(pair) for pair in alignment.pairs],
+        'retained_source_segments': [_segment_to_dict(segment) for segment in alignment.retained_source_segments],
+        'retained_target_segments': [_segment_to_dict(segment) for segment in alignment.retained_target_segments],
     }
     output_path = Path(path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -31,6 +34,9 @@ def load_alignment_result(path: str | Path) -> AlignmentResult:
         source_lang=payload.get('source_lang', ''),
         target_lang=payload.get('target_lang', ''),
         granularity=payload.get('granularity', ''),
+        extract_mode=payload.get('extract_mode', 'filtered'),
+        retained_source_segments=[_segment_from_dict(item) for item in payload.get('retained_source_segments', [])],
+        retained_target_segments=[_segment_from_dict(item) for item in payload.get('retained_target_segments', [])],
     )
 
 
@@ -62,6 +68,12 @@ def _segment_to_dict(segment: Segment) -> dict:
         'text_end': segment.text_end,
         'raw_html': segment.raw_html,
         'element_xpath': segment.element_xpath,
+        'has_jump_markup': segment.has_jump_markup,
+        'is_note_like': segment.is_note_like,
+        'alignment_role': segment.alignment_role,
+        'paratext_kind': segment.paratext_kind,
+        'filter_reason': segment.filter_reason,
+        'jump_fragments': [_jump_fragment_to_dict(fragment) for fragment in segment.jump_fragments],
         'spans': [_span_to_dict(span) for span in segment.spans],
     }
 
@@ -78,7 +90,35 @@ def _segment_from_dict(payload: dict) -> Segment:
         text_end=payload.get('text_end'),
         raw_html=payload.get('raw_html', ''),
         element_xpath=payload.get('element_xpath', ''),
+        has_jump_markup=bool(payload.get('has_jump_markup', False)),
+        is_note_like=bool(payload.get('is_note_like', False)),
+        alignment_role=payload.get('alignment_role', 'align'),
+        paratext_kind=payload.get('paratext_kind', 'body'),
+        filter_reason=payload.get('filter_reason', ''),
+        jump_fragments=[_jump_fragment_from_dict(item) for item in payload.get('jump_fragments', [])],
         spans=[_span_from_dict(item) for item in payload.get('spans', [])],
+    )
+
+
+def _jump_fragment_to_dict(fragment: JumpFragment) -> dict:
+    return {
+        'kind': fragment.kind,
+        'text': fragment.text,
+        'start': fragment.start,
+        'end': fragment.end,
+        'href': fragment.href,
+        'anchor_id': fragment.anchor_id,
+    }
+
+
+def _jump_fragment_from_dict(payload: dict) -> JumpFragment:
+    return JumpFragment(
+        kind=payload.get('kind', ''),
+        text=payload.get('text', ''),
+        start=payload.get('start'),
+        end=payload.get('end'),
+        href=payload.get('href', ''),
+        anchor_id=payload.get('anchor_id', ''),
     )
 
 

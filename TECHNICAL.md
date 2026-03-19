@@ -348,12 +348,12 @@ class ChapterMatch:
 公开接口：
 
 ```python
-extract_sentence_chapters(book, *, language: str) -> list[ExtractedChapter]
+extract_sentence_chapters(book, *, language: str, extract_mode: str = 'filtered') -> list[ExtractedChapter]
 match_extracted_chapters(source_chapters, target_chapters, *, chapter_match_mode: str = 'structured') -> list[ChapterMatch]
 align_extracted_chapters(source_chapters, target_chapters, *, source_lang: str, target_lang: str, chapter_match_mode: str = 'structured', aligner: BaseAligner | None = None) -> AlignmentResult
-align_books(source_book, target_book, *, source_lang: str, target_lang: str, chapter_match_mode: str = 'structured', aligner: BaseAligner | None = None) -> AlignmentResult
-run_bilingual_epub_pipeline(*, source_epub_path, target_epub_path, output_path, source_lang='ja', target_lang='zh', builder_mode='simple', chapter_match_mode='structured', alignment_json_input_path=None, alignment_json_output_path=None, writeback_mode='paragraph', layout_direction='horizontal', emit_translation_metadata=False, aligner=None) -> AlignmentResult
-build_bilingual_epub_from_alignment_json(*, source_epub_path, target_epub_path, alignment_json_path, output_path, builder_mode='simple', writeback_mode='paragraph', layout_direction='horizontal', emit_translation_metadata=False) -> AlignmentResult
+align_books(source_book, target_book, *, source_lang: str, target_lang: str, chapter_match_mode: str | None = None, extract_mode: str = 'filtered', aligner: BaseAligner | None = None) -> AlignmentResult
+run_bilingual_epub_pipeline(*, source_epub_path, target_epub_path, output_path, source_lang='ja', target_lang='zh', builder_mode='simple', chapter_match_mode=None, extract_mode='filtered', alignment_json_input_path=None, alignment_json_output_path=None, writeback_mode='paragraph', layout_direction='horizontal', emit_translation_metadata=False, aligner=None) -> AlignmentResult
+build_bilingual_epub_from_alignment_json(*, source_epub_path, target_epub_path, alignment_json_path, output_path, builder_mode='simple', writeback_mode='paragraph', layout_direction='horizontal', emit_translation_metadata=False, extract_mode='filtered') -> AlignmentResult
 ```
 
 #### 章节匹配原理
@@ -380,6 +380,30 @@ build_bilingual_epub_from_alignment_json(*, source_epub_path, target_epub_path, 
 - 不启用 paratext-aware skip bias
 - 保留原始顺序与长度约束
 - 适合做对照实验，观察“不过滤直接对齐”的结果
+
+#### `extract_mode=filtered` vs `full_text` vs `filtered_preserve`
+
+`filtered`：
+
+- 使用 `TagFilterConfig` 的默认 skip 规则
+- 启用 segment heuristics
+- 目录、注释跳转、脚注正文等默认不进入对齐
+
+`full_text`：
+
+- 只跳非文本节点
+- 不启用 segment heuristics
+- 目录、注释跳转、脚注正文都允许构造 `Segment`
+- 默认更适合与 `chapter_match_mode='raw'` 搭配
+
+`filtered_preserve`：
+
+- 抽取范围接近 `full_text`
+- 目录、注释、前后附文不会在 extractor 阶段被丢弃
+- 每个 `Segment` 会额外标注 `alignment_role`、`paratext_kind`、`filter_reason`
+- 只有 `alignment_role='align'` 的正文进入章节匹配与 Bertalign
+- 保留段会进入 `AlignmentResult.retained_target_segments` / `retained_source_segments`
+- builder 会把 target 侧保留段写入单独的 `译文附录` XHTML
 
 ### 3.9.1 `bookalign/alignment_json.py`
 
@@ -420,6 +444,7 @@ build_bilingual_epub_on_source_layout(
     target_book: epub.EpubBook,
     output_path: Path,
     *,
+    extract_mode: str = 'filtered',
     writeback_mode: str = 'paragraph',
     layout_direction: str = 'horizontal',
     emit_translation_metadata: bool = False,
@@ -463,6 +488,53 @@ build_bilingual_epub_on_source_layout(
 - 默认不输出 `class/lang/data-bookalign-*` 调试属性
 - `emit_translation_metadata=True` 时才输出调试元数据
 - 输出 XHTML 使用 `pretty_print=True`，便于直接审查
+- `full_text` 主轴下，builder 会消费 `Segment.has_jump_markup` / `is_note_like` / `jump_fragments`
+- 未匹配的 target 注释类 segment 会收束到最后一章末尾的附录区
+
+### 3.10.1 当前对齐 JSON 的分布特征
+
+当前 `tests/artifacts/extract_*/` 下的真实书 JSON 已经能说明，对齐质量不是平均分布，而是明显分层：
+
+- `filtered + 金阁寺(简/繁中)` 以及 `filtered + 假面的告白-简中` 整体较健康，`1-1` 占比高，`skip` 与大 bead 占比低。
+- 《假面的告白》繁中在 `filtered` / `full_text` / `filtered_preserve` 三条主轴下都出现较多 `skip` 与 `4-1/1-4`。
+- `full_text + 金阁寺-繁中` 的全局分布最差，说明这组不适合直接把全部文本带入对齐。
+
+当前分布更适合这样理解：
+
+- `0-1/1-0` 本身不一定是坏事。出现在书头/书尾的连续 run，常常只是导读、版权、目录或译者附文。
+- 真正危险的是正文中段突然出现“稳定 `1-1` -> 连续 `4-1/1-4` -> `1-0/0-1` -> 持续漂移”的模式。
+
+### 3.10.2 当前已确认的断链模式
+
+《假面的告白》繁中的典型断链窗口已经在 JSON 中直接可见：
+
+- 前面先有若干正常 `1-1`
+- 随后局部窗口内出现：
+  - 连续 `4-1`
+  - 中间夹 `1-0`
+  - 句长比极端失衡，例如 `274:14`、`251:9`
+- 后面的 target 句子被整体向后错挂
+
+这类问题已经不是 builder 能修复的，它发生在对齐结果层。
+
+### 3.10.3 断链检测与局部重对齐思路
+
+当前最可行的后续方案不是整本重新调参，而是局部修复：
+
+1. 在正文区按顺序扫描固定窗口。
+2. 为每个窗口统计：
+   - `1-1` 占比
+   - `skip(1-0/0-1)` 占比
+   - 大 bead (`4-1/1-4/3-1/...`) 占比
+   - 句长极端失衡的 pair 数
+3. 如果窗口前方是稳定区，而当前窗口突然出现大量 `skip + big bead + extreme length ratio`，则判定为疑似断链。
+4. 对该窗口单独重对齐：
+   - 收紧 `max_align`
+   - 提高 skip 代价
+   - 保留长度惩罚
+5. 仅当新窗口的 `1-1` 占比更高，且 `skip/big bead` 显著下降时，用新窗口替换原窗口结果。
+
+当前经验上，边界区的大段 `0-1` 应默认视为 paratext 候选，而正文中段的连续 `4-1 + 1-0` 应视为优先修复对象。
 
 #### `writeback_mode=paragraph`
 
@@ -536,9 +608,9 @@ uv run python -m bookalign.epub.debug_report \
 uv run bookalign SOURCE.epub TARGET.epub OUTPUT.epub \
   --source-lang ja \
   --target-lang zh \
+  --extract-mode filtered \
   --builder-mode source_layout \
   --writeback-mode inline \
-  --chapter-match-mode structured \
   --layout-direction horizontal
 ```
 
@@ -566,9 +638,9 @@ alignment = run_bilingual_epub_pipeline(
     output_path=Path("out.epub"),
     source_lang="ja",
     target_lang="zh",
+    extract_mode="filtered",
     builder_mode="source_layout",
     writeback_mode="inline",
-    chapter_match_mode="structured",
     layout_direction="horizontal",
 )
 ```
@@ -586,6 +658,7 @@ result = align_books(
     target_book,
     source_lang="ja",
     target_lang="zh",
+    extract_mode="filtered",
 )
 ```
 
