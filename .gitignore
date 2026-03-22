@@ -18,6 +18,7 @@ scripts/run_window_realign_batch.py
 
 # Generated test artifacts
 tests/artifacts/*
+out/*
 !tests/artifacts/batch_reader_reports/
 !tests/artifacts/batch_reader_reports/**
 !examples/
