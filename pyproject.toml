@@ -10,6 +10,10 @@ dependencies = [
     "pysbd>=0.3.4",
 ]
 
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
 [project.scripts]
 bookalign = "bookalign.cli:main"
 
