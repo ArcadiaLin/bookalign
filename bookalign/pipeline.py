@@ -58,6 +58,14 @@ _PARATEXT_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 _CHAPTER_MARKER_RE = re.compile(r'第?\s*([0-9]+|[一二三四五六七八九十百千〇零两兩]+)\s*[章节回部篇卷]?')
+_CHAPTER_HEADING_RE = re.compile(
+    r'^(?:'
+    r'(?:chapter|book|part)\s+[0-9ivxlcdm]+'
+    r'|第\s*[一二三四五六七八九十百千〇零两兩0-9]+\s*[章节回部篇卷]'
+    r')$',
+    re.IGNORECASE,
+)
+_HEADING_PUNCT_RE = re.compile(r'[。．！？!?…]|\.{3,}')
 _CJK_NUMERALS = {
     '零': 0,
     '〇': 0,
@@ -131,6 +139,8 @@ def match_extracted_chapters(
         [None] * (tgt_len + 1) for _ in range(src_len + 1)
     ]
     scores[0][0] = 0.0
+    source_structural_paratext = _structural_paratext_indexes(source_chapters)
+    target_structural_paratext = _structural_paratext_indexes(target_chapters)
 
     for i in range(src_len + 1):
         for j in range(tgt_len + 1):
@@ -141,6 +151,8 @@ def match_extracted_chapters(
             if i < src_len:
                 skip_source = current + _chapter_skip_penalty(
                     source_chapters[i],
+                    chapter_idx=i,
+                    structural_paratext_indexes=source_structural_paratext,
                     chapter_match_mode=chapter_match_mode,
                 )
                 if skip_source < scores[i + 1][j]:
@@ -150,6 +162,8 @@ def match_extracted_chapters(
             if j < tgt_len:
                 skip_target = current + _chapter_skip_penalty(
                     target_chapters[j],
+                    chapter_idx=j,
+                    structural_paratext_indexes=target_structural_paratext,
                     chapter_match_mode=chapter_match_mode,
                 )
                 if skip_target < scores[i][j + 1]:
@@ -165,11 +179,15 @@ def match_extracted_chapters(
                     src_total=src_len,
                     tgt_total=tgt_len,
                     chapter_match_mode=chapter_match_mode,
+                    source_structural_paratext=source_structural_paratext,
+                    target_structural_paratext=target_structural_paratext,
                 )
                 if pair_cost < scores[i + 1][j + 1]:
                     scores[i + 1][j + 1] = pair_cost
                     back[i + 1][j + 1] = ('match', i, j)
 
+    source_index_by_spine = {chapter.spine_idx: idx for idx, chapter in enumerate(source_chapters)}
+    target_index_by_spine = {chapter.spine_idx: idx for idx, chapter in enumerate(target_chapters)}
     matches: list[ChapterMatch] = []
     i = src_len
     j = tgt_len
@@ -194,6 +212,8 @@ def match_extracted_chapters(
                         src_total=src_len,
                         tgt_total=tgt_len,
                         chapter_match_mode=chapter_match_mode,
+                        source_structural_paratext=source_structural_paratext,
+                        target_structural_paratext=target_structural_paratext,
                     ),
                 )
             )
@@ -208,7 +228,11 @@ def match_extracted_chapters(
         if _should_keep_chapter_match(
             match.source_chapter,
             match.target_chapter,
+            source_idx=source_index_by_spine[match.source_chapter.spine_idx],
+            target_idx=target_index_by_spine[match.target_chapter.spine_idx],
             chapter_match_mode=chapter_match_mode,
+            source_structural_paratext=source_structural_paratext,
+            target_structural_paratext=target_structural_paratext,
         )
     ]
     return substantive or matches
@@ -223,6 +247,8 @@ def _chapter_pair_score(
     src_total: int,
     tgt_total: int,
     chapter_match_mode: str,
+    source_structural_paratext: set[int],
+    target_structural_paratext: set[int],
 ) -> float:
     return max(
         0.0,
@@ -235,6 +261,8 @@ def _chapter_pair_score(
             src_total=src_total,
             tgt_total=tgt_total,
             chapter_match_mode=chapter_match_mode,
+            source_structural_paratext=source_structural_paratext,
+            target_structural_paratext=target_structural_paratext,
         ),
     )
 
@@ -248,6 +276,8 @@ def _chapter_pair_cost(
     src_total: int,
     tgt_total: int,
     chapter_match_mode: str,
+    source_structural_paratext: set[int],
+    target_structural_paratext: set[int],
 ) -> float:
     src_count = max(source_chapter.sentence_count, 1)
     tgt_count = max(target_chapter.sentence_count, 1)
@@ -255,8 +285,16 @@ def _chapter_pair_cost(
 
     paratext_cost = 0.0
     if chapter_match_mode == 'structured':
-        src_paratext = _looks_like_paratext(source_chapter)
-        tgt_paratext = _looks_like_paratext(target_chapter)
+        src_paratext = _is_structured_paratext(
+            source_chapter,
+            chapter_idx=src_idx,
+            structural_paratext_indexes=source_structural_paratext,
+        )
+        tgt_paratext = _is_structured_paratext(
+            target_chapter,
+            chapter_idx=tgt_idx,
+            structural_paratext_indexes=target_structural_paratext,
+        )
         if src_paratext != tgt_paratext:
             paratext_cost += 1.2
         elif src_paratext and tgt_paratext:
@@ -277,6 +315,8 @@ def _chapter_pair_cost(
 def _chapter_skip_penalty(
     chapter: ExtractedChapter,
     *,
+    chapter_idx: int,
+    structural_paratext_indexes: set[int],
     chapter_match_mode: str,
 ) -> float:
     count = chapter.sentence_count
@@ -288,7 +328,11 @@ def _chapter_skip_penalty(
         base = 1.2
     else:
         base = 0.4
-    if chapter_match_mode == 'structured' and _looks_like_paratext(chapter):
+    if chapter_match_mode == 'structured' and _is_structured_paratext(
+        chapter,
+        chapter_idx=chapter_idx,
+        structural_paratext_indexes=structural_paratext_indexes,
+    ):
         return base * 0.25
     return base
 
@@ -297,22 +341,63 @@ def _should_keep_chapter_match(
     source_chapter: ExtractedChapter,
     target_chapter: ExtractedChapter,
     *,
+    source_idx: int,
+    target_idx: int,
     chapter_match_mode: str,
+    source_structural_paratext: set[int],
+    target_structural_paratext: set[int],
 ) -> bool:
     if chapter_match_mode != 'structured':
         return True
     if source_chapter.sentence_count >= 20 or target_chapter.sentence_count >= 20:
-        return True
-    return not (_looks_like_paratext(source_chapter) or _looks_like_paratext(target_chapter))
+        return not (
+            _is_structured_paratext(
+                source_chapter,
+                chapter_idx=source_idx,
+                structural_paratext_indexes=source_structural_paratext,
+            )
+            or _is_structured_paratext(
+                target_chapter,
+                chapter_idx=target_idx,
+                structural_paratext_indexes=target_structural_paratext,
+            )
+        )
+    return not (
+        _is_structured_paratext(
+            source_chapter,
+            chapter_idx=source_idx,
+            structural_paratext_indexes=source_structural_paratext,
+        )
+        or _is_structured_paratext(
+            target_chapter,
+            chapter_idx=target_idx,
+            structural_paratext_indexes=target_structural_paratext,
+        )
+    )
+
+
+def _is_structured_paratext(
+    chapter: ExtractedChapter,
+    *,
+    chapter_idx: int,
+    structural_paratext_indexes: set[int],
+) -> bool:
+    return chapter_idx in structural_paratext_indexes or _looks_like_paratext(chapter)
 
 
 def _looks_like_paratext(chapter: ExtractedChapter) -> bool:
     label = _chapter_label(chapter).casefold()
     if _PARATEXT_TITLE_RE.search(label):
         return True
-    preview_segments = chapter.alignment_segments or chapter.segments
-    preview = ' '.join(segment.text for segment in preview_segments[:3]).casefold()
-    if _PARATEXT_TITLE_RE.search(preview):
+    heading_preview = ' '.join(_chapter_heading_candidates(chapter)[:6]).casefold()
+    if _PARATEXT_TITLE_RE.search(heading_preview):
+        return True
+    short_preview = ' '.join(
+        segment.text.strip()
+        for segment in chapter.segments[:2]
+        if len(segment.text.strip()) <= 20 and not _HEADING_PUNCT_RE.search(segment.text.strip())
+    ).casefold()
+    if short_preview and _PARATEXT_TITLE_RE.search(short_preview):
         return True
     return False
 
@@ -334,9 +419,62 @@ def _chapter_label(chapter: ExtractedChapter) -> str:
     title = (getattr(chapter.doc, 'title', '') or '').strip()
     if title:
         return title
+    headings = _chapter_heading_candidates(chapter)
+    if headings:
+        return headings[0]
     if hasattr(chapter.doc, 'get_name'):
         return chapter.doc.get_name()
     return ''
+
+
+def _chapter_heading_candidates(chapter: ExtractedChapter) -> list[str]:
+    candidates: list[str] = []
+
+    def push(text: str) -> None:
+        normalized = text.strip()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
+    title = (getattr(chapter.doc, 'title', '') or '').strip()
+    if title:
+        push(title)
+
+    for segment in chapter.retained_segments[:12]:
+        if segment.paratext_kind == 'chapter_heading':
+            push(segment.text)
+
+    if not candidates:
+        for segment in chapter.segments[:4]:
+            if len(segment.text.strip()) <= 40:
+                push(segment.text)
+
+    return candidates
+
+
+def _has_chapter_like_heading(chapter: ExtractedChapter) -> bool:
+    if _looks_like_paratext(chapter):
+        return False
+    return any(
+        _CHAPTER_HEADING_RE.fullmatch(candidate.strip())
+        for candidate in _chapter_heading_candidates(chapter)[:3]
+    )
+
+
+def _structural_paratext_indexes(chapters: list[ExtractedChapter]) -> set[int]:
+    chapter_heading_indexes = [idx for idx, chapter in enumerate(chapters) if _has_chapter_like_heading(chapter)]
+    if len(chapter_heading_indexes) < 5:
+        return set()
+
+    first_heading_idx = chapter_heading_indexes[0]
+    last_heading_idx = chapter_heading_indexes[-1]
+    structural: set[int] = set()
+    for idx in range(first_heading_idx):
+        if not _has_chapter_like_heading(chapters[idx]):
+            structural.add(idx)
+    for idx in range(last_heading_idx + 1, len(chapters)):
+        if not _has_chapter_like_heading(chapters[idx]):
+            structural.add(idx)
+    return structural
 
 
 def _parse_cjk_numeral(token: str) -> int | None:
