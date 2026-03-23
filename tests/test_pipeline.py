@@ -139,6 +139,43 @@ def test_match_extracted_chapters_skips_front_and_back_matter():
     assert [match.target_chapter.spine_idx for match in matches] == [1, 2]
 
 
+def test_match_extracted_chapters_skips_structural_frontmatter_before_numbered_sequence():
+    source_book = _book(
+        'Source',
+        'en',
+        [
+            ('Essay', _paragraphs(45, '前言')),
+            ('CHAPTER I', _paragraphs(60, '原一')),
+            ('CHAPTER II', _paragraphs(58, '原二')),
+            ('CHAPTER III', _paragraphs(55, '原三')),
+            ('CHAPTER IV', _paragraphs(57, '原四')),
+            ('CHAPTER V', _paragraphs(59, '原五')),
+            ('Afterword', _paragraphs(32, '附')),
+        ],
+    )
+    target_book = _book(
+        'Target',
+        'zh',
+        [
+            ('希望在人间', _paragraphs(52, '导言')),
+            ('第一章', _paragraphs(61, '译一')),
+            ('第二章', _paragraphs(57, '译二')),
+            ('第三章', _paragraphs(56, '译三')),
+            ('第四章', _paragraphs(60, '译四')),
+            ('第五章', _paragraphs(58, '译五')),
+            ('译后记', _paragraphs(28, '后记')),
+        ],
+    )
+
+    source_chapters = extract_sentence_chapters(source_book, language='en')
+    target_chapters = extract_sentence_chapters(target_book, language='zh')
+    matches = match_extracted_chapters(source_chapters, target_chapters)
+
+    assert len(matches) == 5
+    assert [match.source_chapter.spine_idx for match in matches] == [1, 2, 3, 4, 5]
+    assert [match.target_chapter.spine_idx for match in matches] == [1, 2, 3, 4, 5]
+
+
 def test_match_extracted_chapters_raw_mode_keeps_paratext_candidates():
     source_book = _book(
         'Source',
