@@ -1,6 +1,6 @@
 """Shared dataclasses."""
 
-from bookalign.models.types import (
+from models.types import (
     AlignmentResult,
     AlignedPair,
     BookExtraction,
