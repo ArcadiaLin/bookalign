@@ -465,7 +465,8 @@ def test_extract_segments_filtered_preserve_retains_blocks_inside_annotation_anc
 
 def _book_path(pattern: str) -> Path:
     matches = sorted(BOOKS_DIR.glob(pattern))
-    assert matches, f'No EPUB found for pattern: {pattern}'
+    if not matches:
+        pytest.skip(f'No EPUB found for pattern: {pattern}')
     return matches[0]
 
 
@@ -615,6 +616,8 @@ def test_extract_segments_audits_complex_multilingual_epubs():
 
 @pytest.mark.integration
 def test_debug_report_generator_outputs_markdown(tmp_path):
+    if not sorted(BOOKS_DIR.glob('kinkaku.epub')):
+        pytest.skip('No EPUB found for pattern: kinkaku.epub')
     report = generate_report(
         book_query='kinkaku.epub',
         seed=20260315,
