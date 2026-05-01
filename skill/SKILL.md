@@ -54,6 +54,8 @@ Prefer these Python files as the public surface:
 
 Treat `epub/`, `models/`, `pipeline.py`, and `vendor/` as implementation resources. Read them only when the public APIs are insufficient.
 
+When the task is full-book production rather than one-off inspection, prefer `python scripts/build_bilingual_epub.py ...` and read [references/production-workflow.md](./references/production-workflow.md) first.
+
 ## Follow the normal workflow
 
 1. Run `scripts/check_environment.py` before choosing an alignment backend.
@@ -66,6 +68,24 @@ Treat `epub/`, `models/`, `pipeline.py`, and `vendor/` as implementation resourc
 8. Review diagnostics, unmatched content, and warnings before continuing.
 
 If the user asks for broad automation, still keep explicit review checkpoints between extraction, chapter matching, and alignment.
+
+For controlled whole-book production, use this template:
+
+1. Check environment.
+2. Extract both books.
+3. Audit chapters and spine documents.
+4. Detect mixed-content or drifted chapters.
+5. Produce a chapter-slice plan.
+6. Align each clean slice.
+7. Run diagnostics and export review artifacts.
+8. Build preview/review outputs.
+9. Build the final EPUB.
+
+Important execution boundary:
+
+- production alignment now requires an explicit `slice_plan`
+- implicit chapter-by-index whole-book pairing is not supported
+- chapter matching suggestions remain inspection aids, not production defaults
 
 ## Choose the alignment backend conservatively
 
@@ -119,9 +139,29 @@ Useful practical signals:
 
 If the first suggested match looks structurally wrong, inspect neighboring chapters before aligning anything.
 
+Current matching model note:
+
+- `pipeline.match_extracted_chapters(...)` uses a simplified raw matcher
+- do not expect structured paratext-aware matching modes in the production path
+- use slice planning and explicit review instead of relying on automatic chapter filtering
+
 ## Keep the right object model in memory
 
-Keep extracted books as `BookExtraction` objects. Keep local alignment results as `AlignmentResult` objects. Pass those objects between steps instead of re-reading files unless the user explicitly wants JSON artifacts.
+Keep extracted books as `BookExtraction` objects. Keep local alignment results as `AlignmentResult` objects.
+
+For short exploratory work, keep objects in memory.
+
+For long or review-heavy production work, persist intermediate artifacts under `artifacts/`. This is recommended.
+
+Useful artifact types:
+
+- `source_extraction.json`
+- `target_extraction.json`
+- `slice_manifest.json`
+- `alignment.json`
+- `alignment_report.json`
+- `review.html`
+- final EPUB output
 
 ## Load detailed references only when needed
 
@@ -130,5 +170,7 @@ Read [references/workflow.md](./references/workflow.md) when you need the full r
 Read [references/tooling.md](./references/tooling.md) when you need the standard script entry points, module layout, validation commands, or canonical-vs-compatibility API guidance.
 
 Read [references/api-reference.md](./references/api-reference.md) when you need exact function signatures, return payload shapes, serialization helpers, alignment inspection utilities, rule-management functions, or example call sequences.
+
+Read [references/production-workflow.md](./references/production-workflow.md) when you need the high-level build script, artifact layout, slice-plan schema, or builder-related production guidance.
 
 Read tests in `tests/` when you need concrete usage examples for service APIs or expected payload shapes.

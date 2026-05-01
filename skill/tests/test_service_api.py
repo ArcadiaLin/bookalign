@@ -131,3 +131,89 @@ def test_resolve_cfi_and_extract_text(tmp_path: Path):
 
     text = service.extract_text_by_cfi(extraction, first_segment.segment.cfi)
     assert "甲" in text["text"]
+
+
+def test_preview_and_mixed_content_detection(tmp_path: Path):
+    book = _book(
+        "Mixed",
+        "zh",
+        [
+            (
+                "第一章",
+                "<h1>第一章</h1><p>正文一。</p><aside epub:type='footnote'><p>注释甲。</p></aside><nav epub:type='toc'><ol><li>目录残留</li></ol></nav><p>正文二。</p>",
+            ),
+        ],
+    )
+    path = _write_book(book, tmp_path / "mixed.epub")
+    extraction = api.extract_book(path, language="zh")
+
+    spine = service.preview_spine_documents(extraction)
+    assert spine["documents"][0]["file_name"] == "chapter1.xhtml"
+
+    raw = service.preview_document_raw(extraction, 0)
+    assert "footnote" in raw["raw_html"]
+
+    rendered = service.preview_document_rendered(extraction, 0, mode="markdown")
+    assert "正文一" in rendered["content"]
+
+    headings = service.locate_heading_boundaries(extraction, extraction.chapters[0].chapter_id)
+    assert headings["headings"]
+
+    mixed = service.detect_mixed_content_chapters(extraction)
+    assert mixed["chapters"][0]["note_like_count"] >= 1
+
+
+def test_slice_and_split_helpers(tmp_path: Path):
+    book = _book(
+        "Split",
+        "zh",
+        [
+            (
+                "第一章",
+                "<p>序。</p><p>第一章</p><p>正文甲。</p><p>第二章</p><p>正文乙。</p><aside epub:type='footnote'><p>注释乙。</p></aside>",
+            ),
+        ],
+    )
+    path = _write_book(book, tmp_path / "split.epub")
+    extraction = api.extract_book(path, language="zh")
+    chapter_id = extraction.chapters[0].chapter_id
+
+    sliced = service.slice_chapter(extraction, chapter_id, 1, 3)
+    assert sliced["segment_count"] >= 3
+
+    split = service.split_chapter_by_heading(extraction, chapter_id, headings=["第一章", "第二章"])
+    assert len(split["matches"]) >= 2
+    assert split["slices"]
+
+    regex_split = service.split_chapter_by_predicate(extraction, chapter_id, rule=r"第二章")
+    assert regex_split["matches"][0]["paragraph_idx"] >= 0
+
+    filtered = service.exclude_note_like_segments(extraction, chapter_id)
+    assert filtered["removed_segments"]
+
+
+def test_review_export_and_builder_wrapper(tmp_path: Path):
+    source = _book("Source", "zh", [("第一章", "<p>甲。</p><p>乙。</p>")])
+    target = _book("Target", "ja", [("第一章", "<p>あ。</p><p>い。</p>")])
+    source_extraction = api.extract_book(_write_book(source, tmp_path / "src.epub"), language="zh")
+    target_extraction = api.extract_book(_write_book(target, tmp_path / "tgt.epub"), language="ja")
+
+    alignment = service.align_chapter_pair(
+        source_extraction,
+        target_extraction,
+        source_extraction.chapters[0].chapter_id,
+        target_extraction.chapters[0].chapter_id,
+        aligner=StubBertalignAdapter(),
+    )
+    review = service.export_review_html(alignment, tmp_path / "review.html")
+    assert Path(review["path"]).exists()
+
+    built = service.build_bilingual_epub_from_alignment(
+        alignment,
+        source_extraction,
+        target_extraction,
+        tmp_path / "built.epub",
+        include_note_appendix=False,
+        include_extra_target_appendix=False,
+    )
+    assert Path(built["path"]).exists()

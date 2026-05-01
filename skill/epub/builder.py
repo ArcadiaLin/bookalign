@@ -51,6 +51,7 @@ h1 {
   margin: 0 0 0 1rem;
   color: #555;
   font-size: 0.96rem;
+  text-indent: 2em;
 }
 .empty-source,
 .empty-target {
@@ -103,6 +104,8 @@ class SourceLayoutBuilderConfig:
     note_ref_doc_map: dict[str, str] = field(default_factory=dict)
     retained_doc_name: str = 'xhtml/bookalign-note-target.xhtml'
     retained_extra_doc_name: str = 'xhtml/bookalign-retained-extra.xhtml'
+    include_note_appendix: bool = True
+    include_extra_target_appendix: bool = True
 
 
 @dataclass
@@ -203,6 +206,10 @@ body rt {
   text-align: left;
   text-indent: 0;
 }}
+.bookalign-translation-block[lang|="zh"],
+.bookalign-retained-target-block[lang|="zh"] {{
+  text-indent: 2em;
+}}
 .bookalign-note-ref-marker {{
   display: inline-block;
   margin-left: 0.08em;
@@ -286,6 +293,8 @@ def build_bilingual_epub_on_source_layout(
     emit_translation_metadata: bool = False,
     normalize_vertical_punctuation: bool = True,
     extract_mode: str = 'filtered_preserve',
+    include_note_appendix: bool = True,
+    include_extra_target_appendix: bool = True,
 ) -> None:
     """Write translations back into the source EPUB layout using source CFI anchors.
 
@@ -309,6 +318,8 @@ def build_bilingual_epub_on_source_layout(
         normalize_vertical_punctuation=normalize_vertical_punctuation,
         note_anchor_map=_build_note_anchor_map(alignment),
         note_ref_anchor_map=_build_note_ref_anchor_map(alignment),
+        include_note_appendix=include_note_appendix,
+        include_extra_target_appendix=include_extra_target_appendix,
     )
     css_item = _ensure_css_item(
         source_book,
@@ -638,22 +649,24 @@ def _append_retained_target_documents(
     source_book: epub.EpubBook,
     config: SourceLayoutBuilderConfig,
 ) -> None:
-    _append_retained_target_document(
-        alignment=alignment,
-        source_book=source_book,
-        config=config,
-        doc_name=config.retained_doc_name,
-        title='译注附录',
-        include_notes=True,
-    )
-    _append_retained_target_document(
-        alignment=alignment,
-        source_book=source_book,
-        config=config,
-        doc_name=config.retained_extra_doc_name,
-        title='未对齐译文附录',
-        include_notes=False,
-    )
+    if config.include_note_appendix:
+        _append_retained_target_document(
+            alignment=alignment,
+            source_book=source_book,
+            config=config,
+            doc_name=config.retained_doc_name,
+            title='译注附录',
+            include_notes=True,
+        )
+    if config.include_extra_target_appendix:
+        _append_retained_target_document(
+            alignment=alignment,
+            source_book=source_book,
+            config=config,
+            doc_name=config.retained_extra_doc_name,
+            title='未对齐译文附录',
+            include_notes=False,
+        )
 
 def _append_retained_target_document(
     *,
@@ -755,9 +768,13 @@ def _render_retained_segment_block(
         current_doc_name=current_doc_name,
     )
     if rendered is not None:
+        rendered.set('lang', config.target_lang)
+        _add_class(rendered, 'bookalign-retained-target-block')
         return rendered
 
     paragraph = _make_xhtml_element(root, 'p')
+    paragraph.set('lang', config.target_lang)
+    paragraph.set('class', 'bookalign-retained-target-block')
     if _preserve_target_markup(config):
         _render_target_segments_into(
             paragraph,
@@ -1591,9 +1608,9 @@ def _build_translation_block(
 ):
     tag = _translation_tag_for_block(source_block)
     block = _make_xhtml_element(root, tag)
+    block.set('class', 'bookalign-translation-block')
+    block.set('lang', config.target_lang)
     if config.emit_translation_metadata:
-        block.set('class', 'bookalign-translation-block')
-        block.set('lang', config.target_lang)
         block.set('data-bookalign-anchor-cfi', injection.paragraph_cfi)
         block.set('data-bookalign-paragraph', str(injection.paragraph_idx))
     if _preserve_target_markup(config) and injection.target_segments:
@@ -1647,6 +1664,14 @@ def _insert_after(anchor, new_element) -> None:
 def _has_class(element, class_name: str) -> bool:
     classes = set((element.get('class') or '').split())
     return class_name in classes
+
+
+def _add_class(element, class_name: str) -> None:
+    classes = [item for item in (element.get('class') or '').split() if item]
+    if class_name not in classes:
+        classes.append(class_name)
+    if classes:
+        element.set('class', ' '.join(classes))
 
 
 def _local_tag(tag) -> str:

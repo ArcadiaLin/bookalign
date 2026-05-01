@@ -114,6 +114,7 @@ Important fields:
 Use:
 
 - `service.py` for browsing, chapter matching, alignment, diagnostics, reports, rules, and artifact IO.
+- `production.py` for high-level multi-artifact production workflows.
 - `api.py` for extraction primitives and direct chapter record access.
 - `align/bertalign_adapter.py` for model/backend selection.
 - `extraction_json.py` and `alignment_json.py` for direct serialization helpers.
@@ -248,6 +249,23 @@ Primary agent-facing tool surface.
 
 ### Chapter browsing and text inspection
 
+#### `preview_spine_documents(extraction)`
+
+Return spine order, file names, titles, character counts, and text previews for each readable XHTML document.
+
+#### `preview_document_raw(extraction, spine_idx, max_chars=4000)`
+
+Return raw XHTML content for one spine document.
+
+#### `preview_document_rendered(extraction, spine_idx, mode="html", max_chars=4000)`
+
+Return a simplified rendered preview for one spine document.
+
+Supported `mode`:
+
+- `html`
+- `markdown`
+
 #### `list_book_chapters(extraction, view="summary")`
 
 Return chapter list payload:
@@ -313,6 +331,18 @@ Return structure summary with:
 Use when:
 
 - checking whether a chapter is safe to align.
+
+#### `locate_heading_boundaries(extraction, chapter_id)`
+
+Return heading-like paragraph boundaries inside a single extracted chapter.
+
+Use when:
+
+- producing a slice plan for a dirty chapter.
+
+#### `detect_mixed_content_chapters(extraction)`
+
+Return chapters that appear to mix body text with notes, TOC residue, or repeated heading blocks.
 
 #### `search_book_text(extraction, query, scope="all")`
 
@@ -399,6 +429,24 @@ Notes:
 
 ### Alignment execution
 
+### Chapter slicing and cleanup
+
+#### `slice_chapter(extraction, chapter_id, start_para, end_para, granularity="paragraph", include_retained=True, exclude_note_like=False)`
+
+Return a bounded paragraph/sentence window from one chapter.
+
+#### `split_chapter_by_heading(extraction, chapter_id, headings, granularity="paragraph")`
+
+Return matching heading boundaries plus suggested paragraph slices.
+
+#### `split_chapter_by_predicate(extraction, chapter_id, rule, granularity="paragraph")`
+
+Return regex-matched boundaries plus suggested paragraph slices.
+
+#### `exclude_note_like_segments(extraction, chapter_id, granularity="paragraph")`
+
+Return kept-vs-removed segments for note-like cleanup.
+
 #### `align_chapter_pair(source_extraction, target_extraction, source_chapter_id, target_chapter_id, granularity="sentence", aligner=None)`
 
 Align one source chapter to one target chapter.
@@ -469,6 +517,22 @@ Use when:
 
 - showing a human-readable comparison for review.
 
+#### `sample_alignment_pairs(alignment, strategy="head/middle/tail", count=9)`
+
+Return representative pair samples for fast human review.
+
+#### `find_alignment_outliers(alignment)`
+
+Return suspicious pairs such as empty-side matches, 1:n or n:1 pairs, long pairs, or zero-score pairs.
+
+#### `group_unmatched_by_region(alignment)`
+
+Group consecutive unmatched pairs into chapter-local regions.
+
+#### `compare_alignment_density(alignment)`
+
+Summarize pair counts, segment counts, unmatched counts, and skip ratios by chapter region.
+
 ### Alignment artifacts
 
 #### `export_alignment_json(alignment, output_path)`
@@ -490,6 +554,14 @@ Supported `view`:
 Use when:
 
 - reviewing a saved artifact without rebuilding it in memory first.
+
+#### `export_review_html(alignment, output_path)`
+
+Write a local HTML review page summarizing alignment statistics, warnings, outliers, and sample pairs.
+
+#### `export_review_html_from_artifact(path, output_path)`
+
+Load a saved alignment JSON, then write the same HTML review page.
 
 ### Builder-preview utilities
 
@@ -516,6 +588,24 @@ Return builder-related warnings such as:
 #### `list_warnings(alignment)`
 
 Alias for `list_builder_warnings`.
+
+### Builder entry points
+
+#### `build_bilingual_epub_from_alignment(alignment, source_extraction, target_extraction, output_path, ...)`
+
+Build the final EPUB from in-memory extraction objects plus an `AlignmentResult`.
+
+Important controls:
+
+- `builder_mode`
+- `writeback_mode`
+- `layout_direction`
+- `include_note_appendix`
+- `include_extra_target_appendix`
+
+#### `build_bilingual_epub_from_alignment_artifact(path, source_extraction, target_extraction, output_path, ...)`
+
+Build the final EPUB from a saved alignment JSON artifact.
 
 ### Sampling, language guesses, and anomaly detection
 
@@ -670,6 +760,18 @@ Use when:
 
 ## Serialization Modules
 
+## `production.py`
+
+High-level persisted-artifact workflow helpers.
+
+Stable functions:
+
+- `run_bilingual_production(...)`
+- `align_from_slice_plan(...)`
+- `build_bilingual_epub_from_alignment(...)`
+- `build_bilingual_epub_from_alignment_json(...)`
+- `write_json(path, payload)`
+
 ### `extraction_json.py`
 
 Use directly only when you want explicit control over extraction artifact serialization.
@@ -698,20 +800,37 @@ Stable-enough public functions:
 
 Return sentence-level `ExtractedChapter` objects for readable spine docs.
 
-### `match_extracted_chapters(source_chapters, target_chapters, *, chapter_match_mode="structured")`
+### `match_extracted_chapters(source_chapters, target_chapters, *, chapter_match_mode="raw")`
 
 Return `ChapterMatch` list.
 
 Supported `chapter_match_mode`:
 
-- `structured`
 - `raw`
+
+Notes:
+
+- `structured` chapter filtering is no longer part of the current execution path.
+- chapter matching is intentionally lightweight and should be treated as a suggestion mechanism.
+- use explicit `slice_plan` production jobs for final runs.
 
 Use when:
 
 - you need direct access to matching internals outside the higher-level service wrapper.
 
 Avoid depending on the rest of `pipeline.py` unless you are changing chapter matching behavior.
+
+## `production.py`
+
+### `run_bilingual_production(...)`
+
+High-level multi-artifact production entry point.
+
+Important behavior:
+
+- explicit `slice_plan` input is required for fresh alignment runs
+- implicit chapter-by-index fallback has been removed
+- reuse `alignment_json_input_path` only when you already trust the saved alignment artifact
 
 ## Typical Workflows
 
@@ -767,6 +886,9 @@ summary = service.read_alignment_artifact("/tmp/alignment.json", view="stats")
 - Use `include_retained=True` for review and structural diagnosis.
 - Use `include_retained=False` only when you need a tighter alignable-content view.
 - Inspect `get_chapter_structure` or `detect_chapter_anomalies` before aligning noisy chapters.
+- Use `preview_spine_documents`, `preview_document_raw`, and `detect_mixed_content_chapters` before trusting whole-chapter matches.
+- Use `slice_chapter` or split helpers to turn dirty chapters into clean alignment jobs.
 - Review `inspect_alignment`, `get_unmatched_segments`, and `list_builder_warnings` after each alignment step.
+- Export `review.html` and keep it with the alignment artifact for manual review.
 - Surface missing model/runtime dependencies explicitly.
 - Do not treat heuristic match scores or pair scores as trustworthy semantic confidence.

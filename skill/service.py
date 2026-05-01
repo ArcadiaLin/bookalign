@@ -11,15 +11,20 @@ from pathlib import Path
 import re
 
 from ebooklib import epub
+from lxml import etree
 
 from alignment_json import load_alignment_result, save_alignment_result
 from align.aligner import align_segments
 from align.bertalign_adapter import BertalignAdapter
 from api import get_chapter_records, list_chapters, load_epub
+from epub.builder import build_bilingual_epub, build_bilingual_epub_on_source_layout
 from epub.cfi import resolve_cfi as resolve_epub_cfi
 from epub.extractor import extract_text_from_cfi
+from epub.reader import get_spine_documents
 from models.types import AlignmentResult, BookExtraction, ChapterInfo, SegmentRecord
 from pipeline import extract_sentence_chapters, match_extracted_chapters
+from production import build_bilingual_epub_from_alignment as build_bilingual_epub_artifact
+from production import build_bilingual_epub_from_alignment_json as build_bilingual_epub_artifact_from_json
 
 _NON_WORD_RE = re.compile(r"[^\w]+", re.UNICODE)
 _RULES: dict[str, dict] = {}
@@ -639,6 +644,425 @@ def list_warnings(alignment: AlignmentResult) -> dict:
     return list_builder_warnings(alignment)
 
 
+def preview_spine_documents(extraction: BookExtraction) -> dict:
+    book = _book_from_extraction(extraction)
+    documents = []
+    for spine_idx, doc in get_spine_documents(book):
+        text = _document_text(doc)
+        documents.append(
+            {
+                "spine_index": spine_idx,
+                "file_name": doc.get_name(),
+                "title": getattr(doc, "title", "") or "",
+                "char_count": len(text),
+                "preview_text": text[:240],
+            }
+        )
+    return {
+        "book_id": _book_id(extraction),
+        "extraction_id": _extraction_id(extraction),
+        "documents": documents,
+    }
+
+
+def preview_document_raw(
+    extraction: BookExtraction,
+    spine_idx: int,
+    max_chars: int | None = 4000,
+) -> dict:
+    doc = _resolve_spine_document(extraction, spine_idx)
+    content = doc.get_content().decode("utf-8", errors="replace")
+    if max_chars is not None:
+        content = content[:max_chars]
+    return {
+        "book_id": _book_id(extraction),
+        "extraction_id": _extraction_id(extraction),
+        "spine_index": spine_idx,
+        "file_name": doc.get_name(),
+        "title": getattr(doc, "title", "") or "",
+        "raw_html": content,
+    }
+
+
+def preview_document_rendered(
+    extraction: BookExtraction,
+    spine_idx: int,
+    mode: str = "html",
+    max_chars: int | None = 4000,
+) -> dict:
+    if mode not in {"html", "markdown"}:
+        raise ValueError(f"Unsupported mode: {mode}")
+    doc = _resolve_spine_document(extraction, spine_idx)
+    rendered_html = _simplified_document_html(doc)
+    rendered_text = _document_text(doc)
+    payload = {
+        "book_id": _book_id(extraction),
+        "extraction_id": _extraction_id(extraction),
+        "spine_index": spine_idx,
+        "file_name": doc.get_name(),
+        "title": getattr(doc, "title", "") or "",
+        "mode": mode,
+    }
+    if mode == "html":
+        payload["content"] = rendered_html[:max_chars] if max_chars is not None else rendered_html
+    else:
+        markdown = rendered_text[:max_chars] if max_chars is not None else rendered_text
+        payload["content"] = markdown
+    return payload
+
+
+def locate_heading_boundaries(extraction: BookExtraction, chapter_id: str | int) -> dict:
+    chapter = _resolve_chapter(extraction, chapter_id)
+    records = get_chapter_records(extraction, chapter.chapter_id, granularity="paragraph", include_retained=True)
+    headings = []
+    for record in records:
+        if record.segment.paratext_kind == "chapter_heading" or _looks_like_heading(record.segment.text):
+            headings.append(
+                {
+                    "segment_id": _segment_id(extraction, record),
+                    "chapter_id": record.chapter_id,
+                    "paragraph_idx": record.segment.paragraph_idx,
+                    "text": record.segment.text,
+                    "paratext_kind": record.segment.paratext_kind,
+                }
+            )
+    return {
+        "book_id": _book_id(extraction),
+        "extraction_id": _extraction_id(extraction),
+        "chapter_id": chapter.chapter_id,
+        "headings": headings,
+    }
+
+
+def detect_mixed_content_chapters(extraction: BookExtraction) -> dict:
+    chapters = []
+    for chapter in extraction.chapters:
+        records = get_chapter_records(extraction, chapter.chapter_id, granularity="paragraph", include_retained=True)
+        note_like = sum(1 for record in records if _is_noteish_segment(record.segment))
+        toc_like = sum(1 for record in records if _is_tocish_segment(record.segment))
+        heading_like = sum(1 for record in records if record.segment.paratext_kind == "chapter_heading")
+        body_like = sum(
+            1
+            for record in records
+            if record.segment.alignment_role == "align"
+            and not _is_noteish_segment(record.segment)
+            and not _is_tocish_segment(record.segment)
+        )
+        mixed = body_like > 0 and (note_like > 0 or toc_like > 0 or heading_like >= 2)
+        if mixed:
+            chapters.append(
+                {
+                    "chapter_id": chapter.chapter_id,
+                    "title": chapter.title or chapter.label,
+                    "body_count": body_like,
+                    "note_like_count": note_like,
+                    "toc_like_count": toc_like,
+                    "heading_like_count": heading_like,
+                }
+            )
+    return {"book_id": _book_id(extraction), "chapters": chapters}
+
+
+def slice_chapter(
+    extraction: BookExtraction,
+    chapter_id: str | int,
+    start_para: int,
+    end_para: int,
+    granularity: str = "paragraph",
+    include_retained: bool = True,
+    exclude_note_like: bool = False,
+) -> dict:
+    chapter = _resolve_chapter(extraction, chapter_id)
+    records = get_chapter_records(extraction, chapter.chapter_id, granularity=granularity, include_retained=include_retained)
+    selected = [
+        record
+        for record in records
+        if start_para <= record.segment.paragraph_idx <= end_para
+        and not (exclude_note_like and record.segment.is_note_like)
+    ]
+    return {
+        "book_id": _book_id(extraction),
+        "extraction_id": _extraction_id(extraction),
+        "chapter_id": chapter.chapter_id,
+        "start_para": start_para,
+        "end_para": end_para,
+        "granularity": granularity,
+        "segment_count": len(selected),
+        "segments": [_segment_payload(extraction, record) for record in selected],
+    }
+
+
+def split_chapter_by_heading(
+    extraction: BookExtraction,
+    chapter_id: str | int,
+    headings: list[str],
+    granularity: str = "paragraph",
+) -> dict:
+    chapter = _resolve_chapter(extraction, chapter_id)
+    heading_boundaries = locate_heading_boundaries(extraction, chapter.chapter_id)["headings"]
+    normalized = [heading.strip().casefold() for heading in headings if heading.strip()]
+    matches = [
+        boundary
+        for boundary in heading_boundaries
+        if any(token in boundary["text"].casefold() for token in normalized)
+    ]
+    slices = _boundaries_to_slices(extraction, chapter.chapter_id, matches, granularity=granularity)
+    return {
+        "book_id": _book_id(extraction),
+        "extraction_id": _extraction_id(extraction),
+        "chapter_id": chapter.chapter_id,
+        "matches": matches,
+        "slices": slices,
+    }
+
+
+def split_chapter_by_predicate(
+    extraction: BookExtraction,
+    chapter_id: str | int,
+    rule: str,
+    granularity: str = "paragraph",
+) -> dict:
+    chapter = _resolve_chapter(extraction, chapter_id)
+    records = get_chapter_records(extraction, chapter.chapter_id, granularity="paragraph", include_retained=True)
+    matches = [
+        {
+            "segment_id": _segment_id(extraction, record),
+            "chapter_id": record.chapter_id,
+            "paragraph_idx": record.segment.paragraph_idx,
+            "text": record.segment.text,
+        }
+        for record in records
+        if re.search(rule, record.segment.text, re.IGNORECASE)
+    ]
+    slices = _boundaries_to_slices(extraction, chapter.chapter_id, matches, granularity=granularity)
+    return {
+        "book_id": _book_id(extraction),
+        "extraction_id": _extraction_id(extraction),
+        "chapter_id": chapter.chapter_id,
+        "rule": rule,
+        "matches": matches,
+        "slices": slices,
+    }
+
+
+def exclude_note_like_segments(
+    extraction: BookExtraction,
+    chapter_id: str | int,
+    granularity: str = "paragraph",
+) -> dict:
+    chapter = _resolve_chapter(extraction, chapter_id)
+    records = get_chapter_records(extraction, chapter.chapter_id, granularity=granularity, include_retained=True)
+    kept = [record for record in records if not _is_noteish_segment(record.segment)]
+    removed = [record for record in records if _is_noteish_segment(record.segment)]
+    return {
+        "book_id": _book_id(extraction),
+        "extraction_id": _extraction_id(extraction),
+        "chapter_id": chapter.chapter_id,
+        "kept_segments": [_segment_payload(extraction, record) for record in kept],
+        "removed_segments": [_segment_payload(extraction, record) for record in removed],
+    }
+
+
+def sample_alignment_pairs(
+    alignment: AlignmentResult,
+    strategy: str = "head/middle/tail",
+    count: int = 9,
+) -> dict:
+    if strategy != "head/middle/tail":
+        raise ValueError(f"Unsupported strategy: {strategy}")
+    indices = _sample_pair_indices(len(alignment.pairs), count)
+    return {
+        "alignment_id": _alignment_id(alignment),
+        "strategy": strategy,
+        "pairs": [_pair_payload(alignment, index) for index in indices],
+    }
+
+
+def find_alignment_outliers(alignment: AlignmentResult) -> dict:
+    items = []
+    for index, pair in enumerate(alignment.pairs):
+        source_count = len(pair.source)
+        target_count = len(pair.target)
+        source_text_len = sum(len(segment.text) for segment in pair.source)
+        target_text_len = sum(len(segment.text) for segment in pair.target)
+        flags = []
+        if not pair.source or not pair.target:
+            flags.append("empty_side")
+        if source_count > 1 and target_count == 1:
+            flags.append("many_to_one")
+        if target_count > 1 and source_count == 1:
+            flags.append("one_to_many")
+        if max(source_text_len, target_text_len) >= 280:
+            flags.append("long_pair")
+        if pair.score <= 0:
+            flags.append("zero_score")
+        if flags:
+            items.append(
+                {
+                    "pair_id": f"pair-{index:06d}",
+                    "flags": flags,
+                    "score": pair.score,
+                    "source_count": source_count,
+                    "target_count": target_count,
+                }
+            )
+    return {"alignment_id": _alignment_id(alignment), "items": items}
+
+
+def group_unmatched_by_region(alignment: AlignmentResult) -> dict:
+    groups = []
+    current = None
+    for index, pair in enumerate(alignment.pairs):
+        if pair.source and not pair.target:
+            side = "source"
+            chapter_idx = pair.source[0].chapter_idx
+        elif pair.target and not pair.source:
+            side = "target"
+            chapter_idx = pair.target[0].chapter_idx
+        else:
+            side = None
+            chapter_idx = None
+        if side is None:
+            current = None
+            continue
+        if current and current["side"] == side and current["chapter_idx"] == chapter_idx and current["end_pair_index"] == index - 1:
+            current["end_pair_index"] = index
+            current["pair_count"] += 1
+        else:
+            current = {
+                "side": side,
+                "chapter_idx": chapter_idx,
+                "start_pair_index": index,
+                "end_pair_index": index,
+                "pair_count": 1,
+            }
+            groups.append(current)
+    return {"alignment_id": _alignment_id(alignment), "groups": groups}
+
+
+def compare_alignment_density(alignment: AlignmentResult) -> dict:
+    by_source_chapter: dict[int, dict] = {}
+    for pair in alignment.pairs:
+        chapter_idx = None
+        if pair.source:
+            chapter_idx = pair.source[0].chapter_idx
+        elif pair.target:
+            chapter_idx = pair.target[0].chapter_idx
+        if chapter_idx is None:
+            continue
+        stats = by_source_chapter.setdefault(
+            chapter_idx,
+            {
+                "chapter_idx": chapter_idx,
+                "pair_count": 0,
+                "source_segment_count": 0,
+                "target_segment_count": 0,
+                "unmatched_pair_count": 0,
+            },
+        )
+        stats["pair_count"] += 1
+        stats["source_segment_count"] += len(pair.source)
+        stats["target_segment_count"] += len(pair.target)
+        if not pair.source or not pair.target:
+            stats["unmatched_pair_count"] += 1
+    items = []
+    for chapter_idx in sorted(by_source_chapter):
+        stats = by_source_chapter[chapter_idx]
+        stats["skip_ratio"] = round(stats["unmatched_pair_count"] / stats["pair_count"], 4) if stats["pair_count"] else 0.0
+        items.append(stats)
+    return {"alignment_id": _alignment_id(alignment), "chapters": items}
+
+
+def export_review_html(alignment: AlignmentResult, output_path: str | Path) -> dict:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    summary = get_alignment_summary(alignment)
+    inspection = inspect_alignment(alignment)
+    outliers = find_alignment_outliers(alignment)["items"]
+    samples = sample_alignment_pairs(alignment)["pairs"]
+    warnings = list_builder_warnings(alignment)["warnings"]
+    html_parts = [
+        "<html><head><meta charset='utf-8'><title>Bookalign Review</title></head><body>",
+        "<h1>Bookalign Review</h1>",
+        "<h2>Summary</h2>",
+        f"<pre>{html.escape(json.dumps({'summary': summary, 'inspection': inspection}, ensure_ascii=False, indent=2))}</pre>",
+        "<h2>Builder Warnings</h2>",
+        f"<pre>{html.escape(json.dumps(warnings, ensure_ascii=False, indent=2))}</pre>",
+        "<h2>Outliers</h2>",
+        f"<pre>{html.escape(json.dumps(outliers, ensure_ascii=False, indent=2))}</pre>",
+        "<h2>Sample Pairs</h2>",
+    ]
+    for pair in samples:
+        html_parts.append(f"<h3>{pair['pair_id']}</h3>")
+        html_parts.append(f"<pre>{html.escape(json.dumps(pair, ensure_ascii=False, indent=2))}</pre>")
+    html_parts.append("</body></html>")
+    output_path.write_text("".join(html_parts), encoding="utf-8")
+    return {"artifact_id": _artifact_id(output_path), "path": str(output_path)}
+
+
+def export_review_html_from_artifact(path: str | Path, output_path: str | Path) -> dict:
+    alignment = load_alignment_result(path)
+    return export_review_html(alignment, output_path)
+
+
+def build_bilingual_epub_from_alignment(
+    alignment: AlignmentResult,
+    source_extraction: BookExtraction,
+    target_extraction: BookExtraction,
+    output_path: str | Path,
+    builder_mode: str = "source_layout",
+    writeback_mode: str = "paragraph",
+    layout_direction: str = "horizontal",
+    emit_translation_metadata: bool = False,
+    normalize_vertical_punctuation: bool = True,
+    include_note_appendix: bool = True,
+    include_extra_target_appendix: bool = True,
+) -> dict:
+    path = build_bilingual_epub_artifact(
+        alignment=alignment,
+        source_extraction=source_extraction,
+        target_extraction=target_extraction,
+        output_path=output_path,
+        builder_mode=builder_mode,
+        writeback_mode=writeback_mode,
+        layout_direction=layout_direction,
+        emit_translation_metadata=emit_translation_metadata,
+        normalize_vertical_punctuation=normalize_vertical_punctuation,
+        include_note_appendix=include_note_appendix,
+        include_extra_target_appendix=include_extra_target_appendix,
+    )
+    return {"artifact_id": _artifact_id(path), "path": str(path), "alignment_id": _alignment_id(alignment)}
+
+
+def build_bilingual_epub_from_alignment_artifact(
+    path: str | Path,
+    source_extraction: BookExtraction,
+    target_extraction: BookExtraction,
+    output_path: str | Path,
+    builder_mode: str = "source_layout",
+    writeback_mode: str = "paragraph",
+    layout_direction: str = "horizontal",
+    emit_translation_metadata: bool = False,
+    normalize_vertical_punctuation: bool = True,
+    include_note_appendix: bool = True,
+    include_extra_target_appendix: bool = True,
+) -> dict:
+    built = build_bilingual_epub_artifact_from_json(
+        alignment_json_path=path,
+        source_extraction=source_extraction,
+        target_extraction=target_extraction,
+        output_path=output_path,
+        builder_mode=builder_mode,
+        writeback_mode=writeback_mode,
+        layout_direction=layout_direction,
+        emit_translation_metadata=emit_translation_metadata,
+        normalize_vertical_punctuation=normalize_vertical_punctuation,
+        include_note_appendix=include_note_appendix,
+        include_extra_target_appendix=include_extra_target_appendix,
+    )
+    return {"artifact_id": _artifact_id(built), "path": str(built)}
+
+
 _SUPPORTED_RULE_TYPES = {
     "note_detection",
     "poetry_segmentation",
@@ -865,3 +1289,112 @@ def _json_safe(value):
     if value is None:
         return None
     return json.loads(json.dumps(value, default=str, ensure_ascii=False))
+
+
+def _resolve_spine_document(extraction: BookExtraction, spine_idx: int) -> epub.EpubHtml:
+    book = _book_from_extraction(extraction)
+    for index, doc in get_spine_documents(book):
+        if index == spine_idx:
+            return doc
+    raise KeyError(f"Unknown spine_idx: {spine_idx}")
+
+
+def _document_text(doc: epub.EpubHtml) -> str:
+    root = etree.fromstring(doc.get_content(), parser=etree.XMLParser(recover=True))
+    parts = []
+    for node in root.xpath(".//*[self::xhtml:h1 or self::xhtml:h2 or self::xhtml:h3 or self::xhtml:p or self::xhtml:li or self::xhtml:blockquote]", namespaces={"xhtml": "http://www.w3.org/1999/xhtml"}):
+        text = "".join(node.itertext()).strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _simplified_document_html(doc: epub.EpubHtml) -> str:
+    root = etree.fromstring(doc.get_content(), parser=etree.XMLParser(recover=True))
+    body = root.xpath(".//*[local-name()='body']")
+    if not body:
+        return doc.get_content().decode("utf-8", errors="replace")
+    fragments = []
+    for node in body[0].xpath(".//*[self::xhtml:h1 or self::xhtml:h2 or self::xhtml:h3 or self::xhtml:p or self::xhtml:li or self::xhtml:blockquote]", namespaces={"xhtml": "http://www.w3.org/1999/xhtml"}):
+        fragments.append(etree.tostring(node, encoding="unicode"))
+    return "\n".join(fragments)
+
+
+def _looks_like_heading(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) > 80:
+        return False
+    if re.fullmatch(r"(chapter|part|book)\s+[0-9ivxlcdm]+", stripped, re.IGNORECASE):
+        return True
+    if re.fullmatch(r"第\s*[一二三四五六七八九十百千〇零两兩0-9]+\s*[章节回部篇卷]", stripped):
+        return True
+    return False
+
+
+def _is_noteish_segment(segment) -> bool:
+    if segment.is_note_like or segment.paratext_kind == "note_body":
+        return True
+    text = (segment.text or "").strip()
+    if not text:
+        return False
+    return bool(re.match(r"^(注释|註釋|注|註|译注|譯註)", text))
+
+
+def _is_tocish_segment(segment) -> bool:
+    if segment.paratext_kind == "toc":
+        return True
+    text = (segment.text or "").strip()
+    return bool(re.match(r"^(目录|目錄|目次|contents?)$", text, re.IGNORECASE))
+
+
+def _boundaries_to_slices(
+    extraction: BookExtraction,
+    chapter_id: str,
+    boundaries: list[dict],
+    *,
+    granularity: str,
+) -> list[dict]:
+    records = get_chapter_records(extraction, chapter_id, granularity=granularity, include_retained=True)
+    if not records:
+        return []
+    paragraph_indices = sorted({record.segment.paragraph_idx for record in records})
+    start_idx = paragraph_indices[0]
+    end_idx = paragraph_indices[-1]
+    boundary_points = sorted({boundary["paragraph_idx"] for boundary in boundaries})
+    if not boundary_points:
+        return [{"start_para": start_idx, "end_para": end_idx}]
+    slices = []
+    current = start_idx
+    for point in boundary_points:
+        if point > current:
+            slices.append({"start_para": current, "end_para": point - 1})
+        current = point
+    slices.append({"start_para": current, "end_para": end_idx})
+    return slices
+
+
+def _sample_pair_indices(total: int, count: int) -> list[int]:
+    if total <= 0:
+        return []
+    if total <= count:
+        return list(range(total))
+    chunk = max(1, count // 3)
+    head = list(range(min(chunk, total)))
+    middle_start = max(0, total // 2 - chunk // 2)
+    middle = list(range(middle_start, min(total, middle_start + chunk)))
+    tail = list(range(max(0, total - chunk), total))
+    return sorted(dict.fromkeys([*head, *middle, *tail]))
+
+
+def _pair_payload(alignment: AlignmentResult, index: int) -> dict:
+    pair = alignment.pairs[index]
+    return {
+        "pair_id": f"pair-{index:06d}",
+        "score": pair.score,
+        "source": [_segment_brief(segment) for segment in pair.source],
+        "target": [_segment_brief(segment) for segment in pair.target],
+        "source_text": " ".join(segment.text for segment in pair.source),
+        "target_text": " ".join(segment.text for segment in pair.target),
+    }

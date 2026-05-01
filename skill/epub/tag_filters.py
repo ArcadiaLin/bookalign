@@ -264,6 +264,9 @@ def build_tag_filter_config(extract_mode: str = 'filtered_preserve') -> TagFilte
         skip_rules=[],
         policies=_filtered_preserve_policies(),
         apply_segment_heuristics=False,
+        skip_text_patterns=[],
+        skip_heading_patterns=[],
+        skip_line_patterns=[],
     )
 
 

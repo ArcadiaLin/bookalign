@@ -189,7 +189,6 @@ def _segment_extraction_decision(
 
 
 def _classify_paratext_kind(element, text: str, config: TagFilterConfig) -> tuple[str, str]:
-    lower = text.casefold()
     classes = set(element.get('class', '').split())
     element_id = element.get('id', '')
 
@@ -210,6 +209,10 @@ def _classify_paratext_kind(element, text: str, config: TagFilterConfig) -> tupl
     if re.search(r'(copyright|license|colophon|isbn)', element_id, re.IGNORECASE):
         return 'metadata', 'metadata_id'
 
+    if not config.apply_segment_heuristics:
+        return 'body', ''
+
+    lower = text.casefold()
     if any(re.search(pattern, lower, re.IGNORECASE) for pattern in config.skip_text_patterns):
         return 'metadata', 'skip_text_pattern'
     if any(re.search(pattern, text, re.IGNORECASE) for pattern in config.skip_line_patterns):
