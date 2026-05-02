@@ -1,4 +1,4 @@
-# Bookalign Workflow Reference
+# Bookalign LaBSE Workflow Reference
 
 ## Table of Contents
 
@@ -32,17 +32,25 @@ Bookalign is not a full workflow engine:
 - pair scores are not calibrated semantic confidence scores
 - whole-book automatic alignment should not be treated as safe by default
 
+Bookalign chapter metadata also has an important boundary:
+
+- `chapter_id` is a useful lookup key inside one extracted view
+- it is not a guaranteed stable anchor across previews, heading text, and sentence-level record ownership
+
 ## Standard workflow
 
 Follow this order unless the user explicitly asks for a narrower task:
 
-1. Check runtime readiness with `python scripts/check_environment.py`.
-2. Extract one or two books with `api.extract_book(...)`.
-3. Browse chapters and anomaly signals before alignment.
-4. Suggest chapter matches.
-5. Align one chapter pair or a small chapter range at a time.
-6. Inspect warnings, unmatched content, and suspicious pairs.
-7. Iterate.
+1. Ask the user to confirm `<skill-root>`, `<python-entry>`, local model path, remote-inference policy, and artifact location.
+2. Check runtime readiness with `<python-entry> <skill-root>/scripts/check_environment.py`.
+3. Extract one or two books with `api.extract_book(...)`.
+4. Browse chapters and anomaly signals before alignment.
+5. Run a chapter-consistency self-check against sentence-level records.
+6. Suggest chapter matches.
+7. Align one chapter pair or a small chapter range at a time.
+8. Inspect warnings, unmatched content, and suspicious pairs.
+9. Call `service.review_unaligned_segments(...)` to inspect every remaining one-sided block before deciding whether to continue.
+10. Iterate.
 
 ### Import pattern
 
@@ -50,7 +58,7 @@ Follow this order unless the user explicitly asks for a narrower task:
 import sys
 from pathlib import Path
 
-SKILL_ROOT = Path("/root/projs/bookalign/skill")
+SKILL_ROOT = Path("<skill-root>")
 if str(SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(SKILL_ROOT))
 
@@ -77,6 +85,23 @@ Review for:
 - suspiciously short or long chapters
 - chapters dominated by retained paratext
 - chapter boundaries that do not line up with expected structure
+
+### Chapter-consistency self-check
+
+Run this before trusting chapter matching:
+
+1. Call `service.list_book_chapters(...)`.
+2. Inspect visible openings with `service.get_chapter_preview(...)`.
+3. Confirm heading candidates with `service.get_chapter_structure(...)`.
+4. Compare those results against a direct sample from `extraction.sentence_segments` or `service.sample_sentences(...)`.
+
+You are checking whether:
+
+- the chapter preview and the first sentence records describe the same body section
+- notes, chronology, commentary, or preface residue were merged into the same visible chapter bucket
+- paragraph or section indexing appears to reset inside one `chapter_id`
+
+If these views disagree, stop and inspect spine documents or raw text before aligning.
 
 ### Detect chapter-number drift explicitly
 
@@ -155,7 +180,7 @@ Use local backend when:
 - GPU is available or CPU use is acceptable
 - local model loading is preferred
 
-When `scripts/check_environment.py` reports `recommended_backend` as `local_cuda` or `local_cpu`, prefer the explicit `recommended_model_name` path instead of a registry/model-hub identifier. For this environment, that usually means a direct local path such as `/root/models/LaBSE`.
+When `scripts/check_environment.py` reports `recommended_backend` as `local_cuda` or `local_cpu`, prefer the explicit `recommended_model_name` path instead of a registry/model-hub identifier. That should be a user-confirmed local path such as `<local-labse-model-path>`.
 
 Interpret the environment report this way:
 
@@ -185,11 +210,19 @@ Use these APIs after each local alignment:
 - `service.get_aligned_pairs(alignment, limit=100)`
 - `service.get_unmatched_segments(alignment, side="source")`
 - `service.get_unmatched_segments(alignment, side="target")`
+- `service.review_unaligned_segments(alignment)`
 - `service.get_alignment_block_text(alignment, pair_id)`
 - `service.list_builder_warnings(alignment)`
 - `service.build_single_chapter_preview(alignment, source_chapter_id, mode="html")`
 
 Treat the `score` field from `service.get_aligned_pairs(...)` as a placeholder transport value, not as a model confidence score. Real review should focus on text plausibility, unmatched segments, and warning patterns.
+
+Prefer `service.review_unaligned_segments(...)` when the agent needs one pass that shows all currently unaligned source-only and target-only content, with both per-pair details and merged unmatched regions. This is the recommended interface for deciding whether to:
+
+- manually align a leftover block
+- reslice the chapter
+- run another local alignment pass
+- intentionally leave a region unmatched
 
 ### Suspicious pair loop
 
@@ -282,5 +315,6 @@ Use:
 
 - `service.get_alignment_summary(...)`
 - `service.get_unmatched_segments(...)`
+- `service.review_unaligned_segments(...)`
 - `service.list_builder_warnings(...)`
 - `service.build_single_chapter_preview(...)`

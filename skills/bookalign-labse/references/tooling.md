@@ -1,4 +1,4 @@
-# Bookalign Tooling Reference
+# Bookalign LaBSE Tooling Reference
 
 ## Table of Contents
 
@@ -19,6 +19,28 @@ Treat this skill as a standard `SKILL.md + scripts/ + references/` package:
 
 The implementation is still intentionally importable as a Python package-like directory. Do not move or rename the existing internal modules unless you are updating every import site and test.
 
+## Environment confirmation rules
+
+Do not assume:
+
+- the skill lives under a specific absolute path
+- repo-root `scripts/` or `references/` are the right targets
+- `python` exists
+- a local model is stored in a machine-specific location
+
+Before running tooling, ask the user to confirm:
+
+- `<skill-root>` or `<repo-root>`
+- `<python-entry>` for this session
+- whether `uv run python`, `<repo-root>/.venv/bin/python`, or `python3` should be used
+- local model path and remote-inference policy
+
+Recommended interpreter priority:
+
+1. user-confirmed `uv run python` or project-local virtualenv
+2. `python3`
+3. `python` only when explicitly confirmed
+
 ## Canonical scripts
 
 Use these scripts as the preferred command-line entry points:
@@ -38,8 +60,8 @@ Purpose:
 Typical usage:
 
 ```bash
-python scripts/check_environment.py
-python scripts/check_environment.py --json
+<python-entry> <skill-root>/scripts/check_environment.py
+<python-entry> <skill-root>/scripts/check_environment.py --json
 ```
 
 Read these JSON fields before selecting a backend:
@@ -67,8 +89,8 @@ Purpose:
 Typical usage:
 
 ```bash
-python scripts/smoke_test.py
-python scripts/smoke_test.py --json
+<python-entry> <skill-root>/scripts/smoke_test.py
+<python-entry> <skill-root>/scripts/smoke_test.py --json
 ```
 
 ### `scripts/epub_debug_report.py`
@@ -81,8 +103,8 @@ Purpose:
 Typical usage:
 
 ```bash
-python scripts/epub_debug_report.py --book /path/to/book.epub
-python scripts/epub_debug_report.py --book '*.epub' --test-type mixed --granularity sentence
+<python-entry> <skill-root>/scripts/epub_debug_report.py --book /path/to/book.epub
+<python-entry> <skill-root>/scripts/epub_debug_report.py --book '*.epub' --test-type mixed --granularity sentence
 ```
 
 ## Python module map
@@ -126,9 +148,9 @@ Keep the compatibility aliases unless you are ready to update all call sites, do
 Representative validation commands for this skill:
 
 ```bash
-python skill/scripts/check_environment.py --json
-python skill/scripts/smoke_test.py --json
-uv run pytest skill/tests -q
+<python-entry> <skill-root>/scripts/check_environment.py --json
+<python-entry> <skill-root>/scripts/smoke_test.py --json
+uv run pytest skills/bookalign-labse/tests -q
 ```
 
-Use `scripts/smoke_test.py` for fast verification after documentation or wiring changes. Use `uv run pytest skill/tests -q` before finishing any structural change that might affect imports, extraction behavior, or public service APIs.
+Use `scripts/smoke_test.py` for fast verification after documentation or wiring changes. Use `uv run pytest skills/bookalign-labse/tests -q` before finishing any structural change that might affect imports, extraction behavior, or public service APIs.

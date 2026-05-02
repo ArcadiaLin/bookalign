@@ -1,4 +1,0 @@
-interface:
-  display_name: "Bookalign"
-  short_description: "Stepwise EPUB extraction and alignment skill"
-  default_prompt: "Use $bookalign to inspect two EPUBs, review chapter matches, and align one chapter pair at a time."

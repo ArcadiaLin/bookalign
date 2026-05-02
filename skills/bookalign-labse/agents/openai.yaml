@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bookalign LaBSE"
+  short_description: "Stepwise EPUB extraction and alignment skill"
+  default_prompt: "Use $bookalign-labse to inspect two EPUBs, review chapter matches, and align one chapter pair at a time."

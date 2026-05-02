@@ -15,7 +15,7 @@ COPY_ROOT = Path(__file__).resolve().parents[1]
 if str(COPY_ROOT) not in sys.path:
     sys.path.insert(0, str(COPY_ROOT))
 
-from epub.builder import _collect_runtime_text_spans, build_bilingual_epub_on_source_layout  # noqa: E402
+from epub.builder import _collect_runtime_text_spans, build_bilingual_epub, build_bilingual_epub_on_source_layout  # noqa: E402
 from epub.extractor import _collect_text_spans, extract_segments  # noqa: E402
 from epub.reader import get_spine_documents, read_epub  # noqa: E402
 from epub.sentence_splitter import SentenceSplitter  # noqa: E402
@@ -122,3 +122,77 @@ def test_source_layout_builder_still_injects_translation_blocks(tmp_path: Path):
     assert "bookalign-translation-block" in content
     assert "A. B." in content
     assert "<strong>甲。</strong>" in content
+
+
+def test_source_layout_builder_indents_chinese_translation_blocks_by_default(tmp_path: Path):
+    source_book = _book(
+        "Japanese Source",
+        "ja",
+        "第一章",
+        "<div class='chapter'><p>甲。</p></div>",
+    )
+    target_book = _book("Chinese Target", "zh", "第一章", "<p>这是译文。</p>")
+    chapter = get_spine_documents(source_book)[0][1]
+    source_segments = extract_segments(
+        source_book,
+        chapter,
+        chapter_idx=0,
+        splitter=SentenceSplitter(language="ja"),
+    )
+
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[source_segments[0]],
+                target=[_segment("这是译文。", paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+        ],
+        source_lang="ja",
+        target_lang="zh",
+        granularity="sentence",
+    )
+
+    output_path = tmp_path / "aligned-source-layout-zh.epub"
+    build_bilingual_epub_on_source_layout(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+        emit_translation_metadata=True,
+    )
+
+    built = read_epub(output_path)
+    docs = get_spine_documents(built)
+    content = docs[0][1].get_content().decode("utf-8")
+    assert ">  这是译文。<" in content
+
+
+def test_generated_bilingual_epub_indents_chinese_target_paragraphs_by_default(tmp_path: Path):
+    source_book = _book("Source", "ja", "第一章", "<p>甲。</p>")
+    target_book = _book("Target", "zh", "第一章", "<p>这是译文。</p>")
+    alignment = AlignmentResult(
+        pairs=[
+            AlignedPair(
+                source=[_segment("甲。", chapter_idx=0, paragraph_idx=0, sentence_idx=0)],
+                target=[_segment("这是译文。", chapter_idx=0, paragraph_idx=0, sentence_idx=0)],
+                score=1.0,
+            ),
+        ],
+        source_lang="ja",
+        target_lang="zh",
+        granularity="sentence",
+    )
+
+    output_path = tmp_path / "generated-bilingual-zh.epub"
+    build_bilingual_epub(
+        alignment,
+        source_book,
+        target_book,
+        output_path,
+    )
+
+    built = read_epub(output_path)
+    docs = get_spine_documents(built)
+    content = docs[0][1].get_content().decode("utf-8")
+    assert ">  这是译文。<" in content

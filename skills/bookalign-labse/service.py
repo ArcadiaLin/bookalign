@@ -403,6 +403,73 @@ def get_unmatched_segments(alignment: AlignmentResult, side: str = "source") -> 
     return {"alignment_id": _alignment_id(alignment), "side": side, "items": unmatched}
 
 
+def review_unaligned_segments(alignment: AlignmentResult) -> dict:
+    items = []
+    regions = []
+    current_region = None
+
+    for index, pair in enumerate(alignment.pairs):
+        if pair.source and not pair.target:
+            side = "source"
+        elif pair.target and not pair.source:
+            side = "target"
+        else:
+            side = None
+
+        if side is None:
+            current_region = None
+            continue
+
+        pair_payload = _pair_payload(alignment, index)
+        pair_payload["side"] = side
+        items.append(pair_payload)
+
+        chapter_idx = pair.source[0].chapter_idx if pair.source else pair.target[0].chapter_idx
+        if (
+            current_region
+            and current_region["side"] == side
+            and current_region["chapter_idx"] == chapter_idx
+            and current_region["end_pair_index"] == index - 1
+        ):
+            current_region["end_pair_index"] = index
+            current_region["pair_count"] += 1
+            current_region["items"].append(pair_payload)
+        else:
+            current_region = {
+                "region_id": f"unmatched-{len(regions):04d}",
+                "side": side,
+                "chapter_idx": chapter_idx,
+                "start_pair_index": index,
+                "end_pair_index": index,
+                "pair_count": 1,
+                "items": [pair_payload],
+            }
+            regions.append(current_region)
+
+    region_payloads = []
+    for region in regions:
+        region_items = region.pop("items")
+        region_payloads.append(
+            {
+                **region,
+                "start_pair_id": f"pair-{region['start_pair_index']:06d}",
+                "end_pair_id": f"pair-{region['end_pair_index']:06d}",
+                "source_text": "\n".join(item["source_text"] for item in region_items if item["source_text"]),
+                "target_text": "\n".join(item["target_text"] for item in region_items if item["target_text"]),
+                "source_segments": [segment for item in region_items for segment in item["source"]],
+                "target_segments": [segment for item in region_items for segment in item["target"]],
+                "pairs": region_items,
+            }
+        )
+
+    return {
+        "alignment_id": _alignment_id(alignment),
+        "pair_count": len(items),
+        "items": items,
+        "regions": region_payloads,
+    }
+
+
 def get_alignment_block_text(alignment: AlignmentResult, pair_id: str) -> dict:
     index = _pair_index(pair_id)
     pair = alignment.pairs[index]

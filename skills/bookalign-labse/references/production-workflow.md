@@ -11,13 +11,14 @@ Important current constraint:
 - `slice_plan_json` is required for new production alignment runs
 - the previous implicit chapter-by-index fallback has been removed
 - if you do not have a trustworthy slice plan yet, stop and inspect instead of running production
+- `slice_plan_json` only expresses clean chapter slices; it is not expressive enough for every mixed-chapter case
 
 ## Official High-Level Entry Point
 
 Prefer:
 
 ```bash
-python scripts/build_bilingual_epub.py \
+<python-entry> <skill-root>/scripts/build_bilingual_epub.py \
   --source-epub /path/source.epub \
   --target-epub /path/target.epub \
   --artifacts-dir /path/artifacts \
@@ -40,14 +41,16 @@ The script builds on the existing source-layout EPUB builder instead of replacin
 
 ## Recommended Workflow
 
-1. Run `python scripts/check_environment.py --json`.
-2. Extract both books.
-3. Inspect chapter lists and spine documents.
-4. Detect mixed-content chapters and chapter drift.
-5. Create a chapter-slice plan.
-6. Align each clean slice.
-7. Review diagnostics and the generated review HTML.
-8. Build the final EPUB.
+1. Ask the user to confirm `<python-entry>`, `<skill-root>`, model path, remote-inference policy, and artifacts directory.
+2. Run `<python-entry> <skill-root>/scripts/check_environment.py --json`.
+3. Extract both books.
+4. Inspect chapter lists and spine documents.
+5. Compare chapter listings against sampled `sentence_segments` and visible headings.
+6. Detect mixed-content chapters and chapter drift.
+7. Create a chapter-slice plan only for clean slices.
+8. Align each clean slice.
+9. Review diagnostics and the generated review HTML.
+10. Build the final EPUB.
 
 ## Important Service APIs for Production
 
@@ -112,6 +115,12 @@ Field semantics:
 - `include_retained`: keep non-alignable segments as retained artifacts for builder/review use
 - `granularity`: currently prefer `sentence`
 
+Boundary note:
+
+- this schema assumes each job can be described as one `chapter_id` plus monotonic paragraph bounds
+- if a single `chapter_id` contains multiple body regions, note blocks, or paragraph-index resets, this schema is not a safe representation
+- for those cases, inspect the spine documents first and either split earlier with service helpers or construct a reviewed `AlignmentResult` manually outside the production shortcut
+
 Use `jobs` when you want explicit slice identities and independent ranges. Use `pairs` only for a simpler compatibility form.
 
 Execution rule:
@@ -134,6 +143,7 @@ Default production recommendation:
 - `builder_mode="source_layout"`
 - `writeback_mode="paragraph"`
 - `layout_direction="horizontal"`
+- Chinese target paragraphs are indented by default with two leading spaces at writeback time
 
 ## Artifact Layout
 

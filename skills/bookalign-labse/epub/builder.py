@@ -106,6 +106,8 @@ class SourceLayoutBuilderConfig:
     retained_extra_doc_name: str = 'xhtml/bookalign-retained-extra.xhtml'
     include_note_appendix: bool = True
     include_extra_target_appendix: bool = True
+    indent_chinese_paragraphs: bool = True
+    chinese_paragraph_indent: str = '  '
 
 
 @dataclass
@@ -262,6 +264,7 @@ def build_bilingual_epub(
         chapter_html = _build_chapter_html(
             chapter_title=chapter_title,
             pairs=pairs_by_chapter[chapter_idx],
+            target_lang=alignment.target_lang,
         )
 
         chapter_item = epub.EpubHtml(
@@ -784,8 +787,12 @@ def _render_retained_segment_block(
             current_doc_name=current_doc_name,
         )
     else:
-        paragraph.text = _normalize_target_text_for_layout(
-            segment.text,
+        paragraph.text = _apply_target_paragraph_indent(
+            _normalize_target_text_for_layout(
+                segment.text,
+                target_lang=config.target_lang,
+                config=config,
+            ),
             target_lang=config.target_lang,
             config=config,
         )
@@ -1316,6 +1323,10 @@ def _render_target_segments_into(
     current_doc_name: str = '',
 ) -> None:
     rendered_segments = [segment for segment in segments if segment.text.strip()]
+    if rendered_segments:
+        indent = _target_paragraph_indent_prefix(config.target_lang, config)
+        if indent:
+            _append_piece(parent, indent)
     joiner = _target_joiner(config.target_lang)
     for index, segment in enumerate(rendered_segments):
         _render_target_segment_into(
@@ -1622,8 +1633,12 @@ def _build_translation_block(
             current_doc_name=current_doc_name,
         )
     else:
-        block.text = _normalize_target_text_for_layout(
-            ''.join(injection.target_texts),
+        block.text = _apply_target_paragraph_indent(
+            _normalize_target_text_for_layout(
+                ''.join(injection.target_texts),
+                target_lang=config.target_lang,
+                config=config,
+            ),
             target_lang=config.target_lang,
             config=config,
         )
@@ -2007,6 +2022,33 @@ def _normalize_target_text_for_layout(
     return text.translate(_VERTICAL_TO_HORIZONTAL_PUNCTUATION)
 
 
+def _target_paragraph_indent_prefix(
+    target_lang: str,
+    config: SourceLayoutBuilderConfig,
+) -> str:
+    if not config.indent_chinese_paragraphs:
+        return ''
+    if target_lang.split('-', 1)[0].casefold() != 'zh':
+        return ''
+    return config.chinese_paragraph_indent
+
+
+def _apply_target_paragraph_indent(
+    text: str,
+    *,
+    target_lang: str,
+    config: SourceLayoutBuilderConfig,
+) -> str:
+    if not text:
+        return text
+    indent = _target_paragraph_indent_prefix(target_lang, config)
+    if not indent:
+        return text
+    if text[:1].isspace() or text.startswith('\u3000'):
+        return text
+    return f'{indent}{text}'
+
+
 def _remove_following_blank_separators(block) -> None:
     sibling = block.getnext()
     while sibling is not None and _is_blank_separator(sibling):
@@ -2308,6 +2350,7 @@ def _build_chapter_html(
     *,
     chapter_title: str,
     pairs: list[AlignedPair],
+    target_lang: str,
 ) -> str:
     paragraphs: dict[int, list[AlignedPair]] = defaultdict(list)
     for pair in sorted(pairs, key=_pair_sort_key):
@@ -2324,6 +2367,11 @@ def _build_chapter_html(
             target_class = 'target-sentence empty-target' if not target_text else 'target-sentence'
             source_text = source_text or '[原文缺失]'
             target_text = target_text or '[未对齐]'
+            target_text = _apply_target_paragraph_indent(
+                target_text,
+                target_lang=target_lang,
+                config=SourceLayoutBuilderConfig(source_lang='', target_lang=target_lang),
+            )
             body_parts.append(
                 ''.join(
                     [

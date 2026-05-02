@@ -217,3 +217,26 @@ def test_review_export_and_builder_wrapper(tmp_path: Path):
         include_extra_target_appendix=False,
     )
     assert Path(built["path"]).exists()
+
+
+def test_review_unaligned_segments(tmp_path: Path):
+    source = _book("Source", "zh", [("第一章", "<p>甲。</p><p>乙。</p><p>丙。</p>")])
+    target = _book("Target", "ja", [("第一章", "<p>あ。</p><p>い。</p>")])
+    source_extraction = api.extract_book(_write_book(source, tmp_path / "src-unmatched.epub"), language="zh")
+    target_extraction = api.extract_book(_write_book(target, tmp_path / "tgt-unmatched.epub"), language="ja")
+
+    alignment = service.align_chapter_pair(
+        source_extraction,
+        target_extraction,
+        source_extraction.chapters[0].chapter_id,
+        target_extraction.chapters[0].chapter_id,
+        aligner=StubBertalignAdapter(),
+    )
+
+    review = service.review_unaligned_segments(alignment)
+    assert review["pair_count"] == 1
+    assert review["items"][0]["side"] == "source"
+    assert review["items"][0]["source_text"] == "丙。"
+    assert review["items"][0]["target_text"] == ""
+    assert review["regions"][0]["source_text"] == "丙。"
+    assert review["regions"][0]["start_pair_id"] == "pair-000002"

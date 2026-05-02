@@ -1,4 +1,4 @@
-# Bookalign API Reference
+# Bookalign LaBSE API Reference
 
 ## Table of Contents
 
@@ -25,7 +25,7 @@ Prefer `service.py` for agent-facing operations. Drop to `api.py` when you need 
 import sys
 from pathlib import Path
 
-SKILL_ROOT = Path("/root/projs/bookalign/skill")
+SKILL_ROOT = Path("<skill-root>")
 if str(SKILL_ROOT) not in sys.path:
     sys.path.insert(0, str(SKILL_ROOT))
 
@@ -56,7 +56,7 @@ Per-chapter metadata.
 
 Important fields:
 
-- `chapter_id`: stable agent-facing id.
+- `chapter_id`: agent-facing lookup key within one extraction, not a cross-view stability guarantee.
 - `chapter_idx`: inferred chapter order index.
 - `spine_idx`: EPUB spine index.
 - `title`
@@ -133,6 +133,8 @@ Prefer the standard scripts for deterministic checks:
 - `scripts/check_environment.py`
 - `scripts/smoke_test.py`
 - `scripts/epub_debug_report.py`
+
+Before using them, ask the user to confirm `<python-entry>`, `<skill-root>`, local model path, and whether remote inference is allowed.
 
 Prefer these service APIs in new workflows:
 
@@ -291,6 +293,7 @@ Notes:
 
 - `kind_guess` is heuristic only. Do not trust it as a strong classifier for contents, chronology, preface, or other front-matter cases.
 - For books with chapter drift, compare `chapter_id` against the visible heading text surfaced by `preview_text_100` and `get_chapter_preview(...)`.
+- Do not assume `chapter_id` and sentence-level ownership stay perfectly aligned; sample `sentence_segments` when the first body match matters.
 
 Use when:
 
@@ -508,6 +511,22 @@ Supported `side`:
 
 - `source`
 - `target`
+
+#### `review_unaligned_segments(alignment)`
+
+Return a review-oriented payload for all currently unmatched content in one call.
+
+Top-level fields:
+
+- `alignment_id`
+- `pair_count`
+- `items`: every one-sided unmatched pair with `pair_id`, `side`, brief segments, `source_text`, and `target_text`
+- `regions`: merged consecutive unmatched ranges within one chapter side
+
+Use when:
+
+- the agent should inspect all leftover source-only and target-only content after one alignment round
+- the next step depends on deciding whether to realign, reslice, or leave a region unmatched
 
 #### `get_alignment_block_text(alignment, pair_id)`
 
@@ -734,7 +753,7 @@ Language aliases normalize several Chinese variants to `zh`.
 
 Backend guidance:
 
-- when a ready local model path exists, prefer a direct local path such as `/root/models/LaBSE` over a registry identifier like `sentence-transformers/LaBSE`.
+- when a ready local model path exists, prefer a direct user-confirmed local path such as `<local-labse-model-path>` over a registry identifier like `sentence-transformers/LaBSE`.
 - use `scripts/check_environment.py --json` to choose `model_backend`, `model_name`, and `device` together.
 
 ### `aligner.align(src_texts, tgt_texts)`
@@ -850,10 +869,14 @@ source = api.extract_book("/path/source.epub", language="ja")
 target = api.extract_book("/path/target.epub", language="zh")
 
 matches = service.suggest_chapter_matches(source, target)
-first = matches["matches"][0]
+candidate = matches["matches"][0]
+
+# Review the candidate with chapter previews or sentence samples before trusting it.
+source_chapter_id = candidate["source_chapter_id"]
+target_chapter_id = candidate["target_chapter_id"]
 
 aligner = BertalignAdapter(
-    model_name="sentence-transformers/LaBSE",
+    model_name="<local-labse-model-path>",
     model_backend="local",
     device="cuda",
     src_lang="ja",
@@ -863,8 +886,8 @@ aligner = BertalignAdapter(
 alignment = service.align_chapter_pair(
     source,
     target,
-    first["source_chapter_id"],
-    first["target_chapter_id"],
+    source_chapter_id,
+    target_chapter_id,
     granularity="sentence",
     aligner=aligner,
 )
@@ -882,12 +905,14 @@ summary = service.read_alignment_artifact("/tmp/alignment.json", view="stats")
 
 ## Practical Guidance
 
-- Prefer `chapter_id` over numeric indices once you already have extracted metadata.
+- Prefer `chapter_id` over numeric indices for local lookup, but not as the only alignment anchor when drift or mixed-content signals exist.
 - Use `include_retained=True` for review and structural diagnosis.
 - Use `include_retained=False` only when you need a tighter alignable-content view.
 - Inspect `get_chapter_structure` or `detect_chapter_anomalies` before aligning noisy chapters.
+- Compare `list_book_chapters(...)`, `get_chapter_preview(...)`, and a sample from `sentence_segments` before trusting the first body chapter.
 - Use `preview_spine_documents`, `preview_document_raw`, and `detect_mixed_content_chapters` before trusting whole-chapter matches.
 - Use `slice_chapter` or split helpers to turn dirty chapters into clean alignment jobs.
+- If one `chapter_id` contains multiple body regions or paragraph-index resets, do not force it into `slice_plan`; use a more explicit reviewed workflow.
 - Review `inspect_alignment`, `get_unmatched_segments`, and `list_builder_warnings` after each alignment step.
 - Export `review.html` and keep it with the alignment artifact for manual review.
 - Surface missing model/runtime dependencies explicitly.
