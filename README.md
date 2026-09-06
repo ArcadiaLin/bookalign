@@ -2,13 +2,15 @@
 
 BookAlign 用来把一本外语原著 EPUB 和它的正式译本 EPUB 做结构化对齐，再重建成适合对照阅读的双语 EPUB。
 
-它不是机翻工具。它做的是：
-
 1. 从原著和译本里抽取正文句段。
 2. 用多语 embedding + 动态规划做局部或章节级对齐。
 3. 保留原书结构，把译文按段落或句子回写到原文 EPUB 里。
 
 当前项目主要面向小说阅读场景，尤其是日语原著配中文译本，也支持英语、西语等语言对的基础流程。
+
+## 友情链接
+
+[bilingual-epub-toolkit](https://github.com/StarryGuli/bilingual-epub-toolkit) 一位朋友做了相近的 idea，采用了 `Gale-Church` 作为对齐算法，无需 GPU 计算，也实现了不错的效果，并且提供了网站在线服务，推荐学习。
 
 ## 两种运行方式
 
@@ -18,8 +20,6 @@ BookAlign 用来把一本外语原著 EPUB 和它的正式译本 EPUB 做结构�
 2. 直接方式：`uv run bookalign ...` CLI pipeline
 
 推荐优先使用 skill。
-
-原因很直接：
 
 - skill 走的是 review-first 流程，先检查环境、再抽取、再审查章节与正文漂移、再做局部切片对齐，最后再 build
 - skill 已经把当前 production workflow 中最容易出错的环节显式化了，例如 `chapter_id` 一致性自检、`slice_plan`、未对齐段落复查
